@@ -2393,6 +2393,40 @@ impl CardPlan {
     }
 }
 
+/// Whether our send-up list (`Host::card_before`: the changed bytes of
+/// copies in the card's memory sent up, their pieces hashed again) goes
+/// first in the submission's own `ExecuteCommandLists` call instead of a
+/// call of its own (`VICTORY_FEED_ONE_CALL=1`; off by default; flips with
+/// the in-run A/B in diagnostics builds).
+///
+/// From fxceless/victory-fork pull request 1137 (exotiquee): one call and
+/// one boundary between calls fewer a submission (~15 µs each on an RTX
+/// 5080 there). The card runs the same commands in the same order: the
+/// submitting thread puts nothing on the queue between the two places (the
+/// up queue's wait, `upq::send`, is put before both; settles come before
+/// `card_before`), and with the relay the queue's order (`QUEUE_ORDER`)
+/// stays held until the call, so a fetch numbered after the send still
+/// runs behind it. Other threads' work on the queue could come between the
+/// two calls before; now it comes before or after both, orders that were
+/// already possible.
+fn feed_one_call() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_FEED_ONE_CALL") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_FEED_ONE_CALL"))
+}
+
+/// With [`feed_one_call`], from `Host::card_before` to the submission's
+/// call: the send-up list, closed and not sent, and with the relay the
+/// queue's order, held until it is on the queue (let go when this is
+/// dropped).
+struct SendUp {
+    list: ID3D12CommandList,
+    _order: Option<std::sync::MutexGuard<'static, u64>>,
+}
+
 /// What a submission does for copies in the card's memory.
 struct CardPlan {
     ranges: Vec<CardRange>,
@@ -4547,10 +4581,14 @@ impl Host {
     /// `relay`).
     /// `picked`: ranges that may be written too, and ranges to look at
     /// (`crate::picked`).
-    fn card_before(&self, declared: &[Declared], picked: &crate::picked::Ranges, flown: bool) -> Option<CardPlan> {
+    ///
+    /// With [`feed_one_call`] the send-up list is closed but not sent: it
+    /// comes back as a [`SendUp`] for the front of the submission's own
+    /// call, and the queue's order (with the relay) stays held until then.
+    fn card_before(&self, declared: &[Declared], picked: &crate::picked::Ranges, flown: bool) -> (Option<CardPlan>, Option<SendUp>) {
         use std::sync::Arc;
         if !crate::shadow::cards() {
-            return None;
+            return (None, None);
         }
         // The ranges this submission's shaders may write, per copy.
         let declared: Vec<Declared> = declared.iter().filter(|(shadow, _)| shadow.carded()).cloned().collect();
@@ -4588,10 +4626,16 @@ impl Host {
         let mut dirty = crate::shadow::card_dirty(sent_as);
         gathering.end();
         if declared.is_empty() && dirty.is_empty() && looked.is_empty() {
-            return None;
+            return (None, None);
         }
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
-        let work = work.as_mut()?;
+        let Some(work) = work.as_mut() else {
+            return (None, None);
+        };
+        // With `VICTORY_FEED_ONE_CALL=1`: the send-up list, closed and not
+        // sent.
+        let one_call = feed_one_call();
+        let mut held: Option<ID3D12CommandList> = None;
         // A copy whose shader writes are declared for the first time gets
         // its bytes from before, whole.
         let mut whole: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
@@ -4735,6 +4779,11 @@ impl Host {
                         }
                     }
                     list.Close()?;
+                    if one_call {
+                        // To the front of the submission's own call.
+                        held = Some(list.cast()?);
+                        return Ok(());
+                    }
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     Ok(())
                 })()
@@ -4744,7 +4793,15 @@ impl Host {
             }
             used.push((false, sync));
         }
-        drop(order);
+        // The send-up list goes to the queue later (`VICTORY_FEED_ONE_CALL`):
+        // the order stays held with it.
+        let sendup = match held {
+            Some(list) => Some(SendUp { list, _order: order }),
+            None => {
+                drop(order);
+                None
+            }
+        };
         let mut plan = CardPlan {
             ranges: Vec::new(),
             check: None,
@@ -4852,7 +4909,7 @@ impl Host {
             plan.lists.push((true, check));
         }
         work.out += 1;
-        Some(plan)
+        (Some(plan), sendup)
     }
 
     /// With [`relay`]: whether the compare's result area is half taken by
@@ -6041,7 +6098,18 @@ impl Host {
             shadow.writing(*at, *len);
         }
         let declared = declared_writes(runs);
-        let card = self.card_before(&declared, &picked, flown);
+        let (card, mut sendup) = self.card_before(&declared, &picked, flown);
+        // `VICTORY_FEED_ONE_CALL=1`: the send-up list first in this
+        // submission's call (in timing runs, in the first group).
+        if let Some(up) = &sendup {
+            lists.insert(0, Some(up.list.clone()));
+            for first in &mut firsts {
+                *first += 1;
+            }
+            if let Some(first) = firsts.first_mut() {
+                *first = 0;
+            }
+        }
         // The sends are taken: from here on the references hold what the
         // copies in the lists put.
         for (shadow, at, bytes) in batch.placed.drain(..) {
@@ -6086,6 +6154,9 @@ impl Host {
                 let mut from = 0;
                 for to in cuts.into_iter().chain([lists.len()]) {
                     self.queue.ExecuteCommandLists(&lists[from..to]);
+                    // (`VICTORY_FEED_ONE_CALL`: the send-up list went in the
+                    // first call; the queue's order is let go.)
+                    drop(sendup.take());
                     from = to;
                 }
                 self.queue.Signal(&self.fence, *submitted)
@@ -6141,6 +6212,9 @@ impl Host {
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
+                // (`VICTORY_FEED_ONE_CALL`: the send-up list went in the
+                // first group; the queue's order is let go.)
+                drop(sendup.take());
                 self.card_sent();
                 let waited = self
                     .queue
@@ -6186,6 +6260,8 @@ impl Host {
             }
             let _ = (i, started);
         }
+        // (Let go before the queue's order is taken below, whatever came.)
+        drop(sendup);
         let _ = &firsts;
         FINISHED.store(this_submission, Ordering::Release);
         bury(this_submission);
