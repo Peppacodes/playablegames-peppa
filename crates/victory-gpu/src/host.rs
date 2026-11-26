@@ -1206,6 +1206,31 @@ mod tests {
 
     use super::*;
 
+    /// An object kept many times is held once until the reset.
+    #[test]
+    fn an_object_kept_again_is_held_once_until_the_reset() {
+        let Some(host) = host() else {
+            eprintln!("no D3D12 device; keep test skipped");
+            return;
+        };
+        let list = host.new_list().unwrap();
+        let (a, _) = host.upload_buffer(256).unwrap();
+        let (b, _) = host.upload_buffer(256).unwrap();
+        for _ in 0..1000 {
+            list.keep(&a);
+        }
+        assert_eq!((list.deferred().kept.len(), list.deferred().kept_at.len()), (1, 1));
+        list.keep(&b);
+        assert_eq!((list.deferred().kept.len(), list.deferred().kept_at.len()), (2, 2));
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        assert!(list.deferred().kept.is_empty() && list.deferred().kept_at.is_empty());
+        list.keep(&a);
+        assert_eq!(list.deferred().kept.len(), 1);
+        list.close();
+    }
+
     #[test]
     fn another_worker_cannot_retarget_a_pending_clear() {
         let Some(host) = host() else {
@@ -2625,6 +2650,10 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// The interfaces [`HostList::keep`] put in `kept`, by address: binding
+    /// the same heap's tables at every draw keeps it once, not once a draw
+    /// (an address held in `kept` names no other object until the reset).
+    kept_at: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// The pipelines [`HostList::bind_pipeline`] kept, by address.
     bound: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Buffer ranges refreshed since the last title copy (host copy,
@@ -7903,9 +7932,17 @@ impl HostList {
     }
 
     /// Keeps `object` alive until the list is reset.
+    /// Once per object and reset: from Marvisak/VIctory pull request 3379.
     pub(crate) fn keep(&self, object: &impl Interface) {
+        let at = object.as_raw() as usize;
+        let mut deferred = self.deferred();
+        if !deferred.kept_at.insert(at) {
+            return;
+        }
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
-            self.deferred().kept.push(object);
+            deferred.kept.push(object);
+        } else {
+            deferred.kept_at.remove(&at);
         }
     }
 
