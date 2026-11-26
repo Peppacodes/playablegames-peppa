@@ -54,6 +54,9 @@ fn parts_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PAGE_PARTS").is_none_or(|v| v != "0"))
 }
 
+mod reservation;
+pub(crate) use reservation::line as reservation_line;
+
 impl Journal {
     /// Page `page` was found written by asking `now`: the parts in `parts`
     /// (a bit each). The asking that found it written before (0: none).
@@ -581,6 +584,12 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     // other threads' askings again (0.5 ms a time, run fills-ab3), and no
     // other asking comes between the two parts.
     let _all = Asking::hold_all();
+    if reservation::enabled() {
+        spent.next("asking: by allocation");
+        reservation::ask(ranges);
+        spent.end();
+        return;
+    }
     ask_ahead_held(ranges.iter().copied(), true);
     spent.next("asking: the rest");
     ask_rest(ranges, true);
@@ -1540,6 +1549,10 @@ fn placeholder(block: usize) -> bool {
 /// The runtime gave the title memory at `[at, at + len)`, allocated or
 /// committed: what was known of holes there is asked again.
 pub fn title_memory_allocated(at: usize, len: usize) {
+    // (`VICTORY_WATCH_RESERVATION`: the allocations it asked by changed.)
+    if reservation::enabled() {
+        ask_once_end();
+    }
     if len == 0 || !known_holes() {
         return;
     }
@@ -2778,6 +2791,9 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     if len == 0 {
         return;
     }
+    // (`VICTORY_WATCH_RESERVATION`: what lies under the asking that stands is
+    // noted written after it.)
+    reservation::completed_write(at, len);
     let mode = page_writes();
     let end = at.saturating_add(len);
     if pages {
@@ -3070,6 +3086,10 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// neither guarded nor writable) and a kernel read into it fail, so the
 /// write access is given back.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    // (`VICTORY_WATCH_RESERVATION`: the allocations it asked by changed.)
+    if reservation::enabled() {
+        ask_once_end();
+    }
     crate::texback::remapped(at, len);
     open(&mut title_memory_changed(at, len), at, at.saturating_add(len));
 }
