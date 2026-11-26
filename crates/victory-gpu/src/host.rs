@@ -3857,6 +3857,9 @@ fn late_line(frames: f64) {
     if !late() {
         return;
     }
+    if submit_fork::on() {
+        tracing::info!("{}", submit_fork::line());
+    }
     let s: Vec<f64> = LATE_STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
         "submissions sent ahead per frame: {:.1} in {:.1} settles ({:.1} flights each time), {:.1} ms waiting for the card in them; \
@@ -3991,6 +3994,8 @@ mod upq;
 pub(crate) use send::{goes_as_words, words_under};
 #[cfg(feature = "diagnostics")]
 pub(crate) mod spans;
+#[path = "host/fork.rs"]
+mod submit_fork;
 mod torn;
 #[cfg(feature = "diagnostics")]
 mod traffic;
@@ -6006,6 +6011,11 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.fill();
+        // All of a fork of the refreshes in front, before the last ones.
+        if batch.fork.is_some() {
+            submit_fork::FIRST_ALL[0].fetch_add(1, Ordering::Relaxed);
+        }
+        batch.fork_join();
         stage.next("submit: the last refreshes");
         batch.flush();
         crate::watch::ask_once_end();
@@ -7690,6 +7700,13 @@ impl HostList {
         self.changed_something();
     }
 
+    /// As [`HostList::defer_host`], for work that writes host copies of title
+    /// memory (the pages of [`crate::memory`]): a fork of the refreshes in
+    /// front is waited for whole before it ([`gate`]).
+    pub(crate) fn defer_host_copies(&self, work: impl Fn() + Send + 'static) {
+        self.deferred().copies.push(Step::Host(Box::new(work), COPIES));
+    }
+
     /// As [`HostList::defer`], for work that writes only host memory.
     pub(crate) fn defer_host(&self, work: impl Fn() + Send + 'static) {
         self.deferred().copies.push(Step::Host(Box::new(work), (0, 0)));
@@ -7741,6 +7758,8 @@ impl HostList {
             if matches!(step, Step::Copy(..) | Step::Fill(..)) && taken(i) {
                 continue;
             }
+            // What it needs of the refreshes in front, if they are forked.
+            batch.fork_gate(step);
             let (started, copied) = match step {
                 &Step::Copy(dst, src, len) => {
                     let started = std::time::Instant::now();
@@ -7865,6 +7884,44 @@ impl HostList {
             add(C::RefreshBytes, refreshed);
             SPLIT[7].fetch_add(us.as_nanos() as u64, Ordering::Relaxed);
         }
+    }
+}
+
+/// The title range of a [`Step::Host`] that marks work on host copies
+/// ([`HostList::defer_host_copies`]): empty, as for work that reads none.
+const COPIES: (usize, usize) = (usize::MAX, usize::MAX);
+
+/// What a step of the lists needs of a fork of the refreshes in front
+/// (`VICTORY_SUBMIT_FORK`, [`submit_fork`]): all of it before a step that
+/// writes title memory or runs work of ours, a copy's before shaders are
+/// given that copy, nothing before the rest (they touch no host copy).
+fn gate(step: &Step) -> submit_fork::Gate {
+    match step {
+        Step::Copy(..) | Step::Placed(_) | Step::Run(_) => submit_fork::Gate::All,
+        // Work of ours on host copies of title memory ([`HostList::defer_host_copies`]).
+        Step::Host(_, COPIES) => submit_fork::Gate::All,
+        // Other work of ours: on textures' staging, descriptors, notes.
+        Step::Host(..) => submit_fork::Gate::Textures,
+        Step::GpuWrite(shadow, ..) => submit_fork::Gate::Copy(std::sync::Arc::as_ptr(shadow) as usize),
+        Step::Fill(..) | Step::Refresh(..) | Step::Texture(_) | Step::Plane(..) => submit_fork::Gate::Free,
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+
+    /// The order a fork of the refreshes in front keeps: steps that write
+    /// title memory or run work of ours wait for all of it; fills and
+    /// planes for nothing (they touch no host copy the fork writes).
+    #[test]
+    fn steps_that_write_title_memory_or_run_ours_wait_for_all_of_a_fork() {
+        assert_eq!(gate(&Step::Copy(1, 2, 3)), submit_fork::Gate::All);
+        assert_eq!(gate(&Step::Run(Box::new(|| {}))), submit_fork::Gate::All);
+        assert_eq!(gate(&Step::Host(Box::new(|| {}), COPIES)), submit_fork::Gate::All);
+        assert_eq!(gate(&Step::Host(Box::new(|| {}), (0, 0))), submit_fork::Gate::Textures);
+        assert_eq!(gate(&Step::Fill(1, 2, 3, None)), submit_fork::Gate::Free);
+        assert_eq!(gate(&Step::Plane((0, 0), Box::new(|| {}))), submit_fork::Gate::Free);
     }
 }
 
@@ -8097,6 +8154,9 @@ struct Batch {
     /// `ahead` holds everything the submission refreshes
     /// ([`Batch::refresh_front`]).
     front: bool,
+    /// The refreshes in front being done on a thread of their own
+    /// (`VICTORY_SUBMIT_FORK`).
+    fork: Option<submit_fork::Fork>,
 }
 
 /// Whether the copies that a submission's shaders write are brought up to
@@ -8553,6 +8613,47 @@ impl Batch {
         self.textures.insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
     }
 
+    /// What `step` needs of a fork of the refreshes in front is done
+    /// ([`gate`]).
+    fn fork_gate(&mut self, step: &Step) {
+        if self.fork.is_none() {
+            return;
+        }
+        match gate(step) {
+            submit_fork::Gate::Free => {}
+            submit_fork::Gate::Copy(copy) => {
+                if let Some(fork) = &self.fork {
+                    fork.wait_copy(copy);
+                }
+            }
+            submit_fork::Gate::Textures => {
+                if let Some(fork) = &self.fork {
+                    fork.wait_textures();
+                }
+            }
+            submit_fork::Gate::All => {
+                // Which kind of step made it wait for all (for the log).
+                let kind = match step {
+                    Step::Copy(..) => 1,
+                    Step::Placed(_) => 2,
+                    Step::Run(_) => 3,
+                    _ => 4,
+                };
+                submit_fork::FIRST_ALL[kind].fetch_add(1, Ordering::Relaxed);
+                // The fills first (they touch no host copy): beside the fork.
+                self.fill();
+                self.fork_join();
+            }
+        }
+    }
+
+    /// All of a fork of the refreshes in front is done.
+    fn fork_join(&mut self) {
+        if let Some(fork) = self.fork.take() {
+            fork.join();
+        }
+    }
+
     /// Before a step that writes title memory: pending refreshes are done
     /// first, and textures are checked again after it.
     fn title_written(&mut self) {
@@ -8676,6 +8777,40 @@ impl Batch {
             FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
         }
         let ahead = spans.len() > 1;
+        // On a thread of its own while the lists' steps go on
+        // (`VICTORY_SUBMIT_FORK`, [`submit_fork`]): the steps wait for what
+        // they need of it ([`gate`]).
+        if submit_fork::on() && !spans.is_empty() {
+            #[cfg(feature = "diagnostics")]
+            FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
+            let keys: Vec<usize> = spans.iter().map(|(shadow, ..)| std::sync::Arc::as_ptr(shadow) as usize).collect();
+            let textures = due.len();
+            self.fork = Some(submit_fork::Fork::start(keys.into_iter(), textures, move |done| {
+                let _flush = crate::timeline::span("refreshes of copies");
+                if ahead {
+                    let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
+                    crate::watch::ask_ahead(&ranges);
+                }
+                let spans = std::sync::Arc::new(spans);
+                let due = std::sync::Arc::new(due);
+                crate::shadow::wide_each(spans.len() + due.len(), move |i| {
+                    let Some(i) = i.checked_sub(due.len()) else {
+                        due[i].refresh();
+                        done.texture();
+                        return;
+                    };
+                    let (shadow, from, to) = &spans[i];
+                    if !(many && shadow.nothing_new(*from, *to - *from)) {
+                        Self::update(shadow, *from, *to);
+                    }
+                    done.copy(std::sync::Arc::as_ptr(shadow) as usize);
+                });
+                if ahead {
+                    crate::watch::ask_ahead_done();
+                }
+            }));
+            return;
+        }
         if ahead {
             let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
             crate::watch::ask_ahead(&ranges);
