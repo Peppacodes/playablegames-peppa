@@ -51,6 +51,8 @@ tempfile.workspace = true
 
 [features]
 # Debugging switches (scripted keys and the like).
+# The Rust side's blocks from mimalloc (victory-gpu).
+mimalloc = ["victory-gpu/mimalloc"]
 diagnostics = ["victory-gpu/diagnostics", "victory-loader/diagnostics", "dep:windows", "dep:windows-core"]
 
 [lints]
