@@ -48,11 +48,20 @@ pub(crate) struct Shadow {
     /// a range holds in part cannot say so in `copied`. Locked inside
     /// `copied`'s lock.
     ranged: Mutex<[(usize, usize, u64); 2]>,
+    /// With `VICTORY_COLD_SKIP`: per 2 MiB chunk, the journal's mark when a
+    /// walk last left it fresh (`crate::cold_skip::Chunks`); empty before the
+    /// first such walk. Locked inside `copied`'s lock.
+    verified: Mutex<Vec<u64>>,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
+    /// Whether `pending` holds any, read without its lock; set and cleared
+    /// with it held (XaviFortes/VIctory-RDNA fdfb306d). Most copies have
+    /// none, and every refresh and "known to copy nothing" look took the
+    /// lock to find that out.
+    has_pending: std::sync::atomic::AtomicBool,
     /// With [`relay`]: how many submissions not yet copied back declared
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
@@ -304,6 +313,25 @@ pub(crate) fn card_room_kept() -> u64 {
     // play-1125-0127: 1,453 passes refused, the ground and people black).
     const SEEN: u64 = 1 << 30;
     card_limits().1.min(SEEN).saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
+}
+
+/// With `VICTORY_COLD_SKIP` on (`crate::cold_skip::on`), since the last
+/// line: pages looked at one by one, pages passed over. A page counts once
+/// for each refresh whose range holds it.
+static COLD_SKIP: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// With the frame-rate line, if a refresh went by `VICTORY_COLD_SKIP`.
+fn cold_skip_line(frames: f64) {
+    let [walked, passed] = [0, 1].map(|i| COLD_SKIP[i].swap(0, Ordering::Relaxed));
+    if walked + passed == 0 {
+        return;
+    }
+    tracing::info!(
+        "refreshes with VICTORY_COLD_SKIP per frame: {:.0} pages of 64 KiB passed over, {:.0} looked at ({:.1}% passed over)",
+        passed as f64 / frames,
+        walked as f64 / frames,
+        passed as f64 * 100.0 / (walked + passed) as f64
+    );
 }
 
 /// The copies in the card's memory.
@@ -1300,6 +1328,7 @@ mod relay_tests {
 }
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
+/// Kept sorted by capacity, largest first ([`pool_take`], [`pool_put`]).
 static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
 /// An empty buffer with room for `n` bytes, from the pool if it has one
@@ -1308,19 +1337,29 @@ static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 /// reserved (1.4 GB in run 24).
 fn pooled(n: usize) -> Vec<u8> {
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    let most = n.saturating_mul(4).max(1 << 20);
-    let fit = pool
-        .iter()
-        .enumerate()
-        .filter(|(_, v)| v.capacity() >= n && v.capacity() <= most)
-        .min_by_key(|(_, v)| v.capacity())
-        .map(|(i, _)| i);
-    let mut v = match fit {
-        Some(i) => pool.swap_remove(i),
-        None => Vec::with_capacity(n),
-    };
+    let mut v = pool_take(&mut pool, n).unwrap_or_else(|| Vec::with_capacity(n));
     v.clear();
     v
+}
+
+/// Of `pool` (sorted, largest first): the smallest buffer with room for `n`
+/// bytes and no more than four times that (or 1 MiB), taken out; the pool
+/// stays sorted. One binary search, where the whole pool (up to 1,024) was
+/// looked through under the lock (Marvisak/VIctory pull request 3384,
+/// borosf).
+fn pool_take(pool: &mut Vec<Vec<u8>>, n: usize) -> Option<Vec<u8>> {
+    let most = n.saturating_mul(4).max(1 << 20);
+    // Largest first: the ones with room end where the first without begins,
+    // and the one before it is the smallest with room.
+    let i = pool.partition_point(|v| v.capacity() >= n).checked_sub(1)?;
+    (pool[i].capacity() <= most).then(|| pool.remove(i))
+}
+
+/// `v` into `pool` (sorted, largest first), where it keeps the pool sorted:
+/// the place a stable sort of the pool with `v` at its end gives it.
+fn pool_put(pool: &mut Vec<Vec<u8>>, v: Vec<u8>) {
+    let at = pool.partition_point(|b| b.capacity() >= v.capacity());
+    pool.insert(at, v);
 }
 
 /// How many snapshot buffers are kept (`VICTORY_SNAPSHOT_POOL`; `8`: as
@@ -1343,8 +1382,8 @@ fn snapshots_kept() -> usize {
 fn give_back(v: Vec<u8>) {
     const KEPT: usize = 512 << 20;
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    pool.push(v);
-    pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
+    // (Sorted as it is kept: no sort of the whole pool at every return.)
+    pool_put(&mut pool, v);
     let (mut kept, mut total) = (0, 0usize);
     for v in pool.iter().take(snapshots_kept()) {
         total = total.saturating_add(v.capacity());
@@ -1357,6 +1396,57 @@ fn give_back(v: Vec<u8>) {
     let gone = pool.split_off(kept);
     drop(pool);
     drop(gone);
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::{pool_put, pool_take};
+
+    /// As `pooled` and `give_back` chose before the pool was kept sorted: a
+    /// scan for the smallest with room, a sort at every return.
+    fn take_scanning(pool: &mut Vec<Vec<u8>>, n: usize) -> Option<Vec<u8>> {
+        let most = n.saturating_mul(4).max(1 << 20);
+        let fit = pool
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v.capacity() >= n && v.capacity() <= most)
+            .min_by_key(|(_, v)| v.capacity())
+            .map(|(i, _)| i)?;
+        Some(pool.swap_remove(fit))
+    }
+
+    #[test]
+    fn the_pool_stays_sorted_and_gives_what_the_scan_gave() {
+        let (mut sorted, mut scanned): (Vec<Vec<u8>>, Vec<Vec<u8>>) = (Vec::new(), Vec::new());
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x % n) as usize
+        };
+        // Sizes from 4 KiB to 2 MiB, many alike.
+        let size = |k: usize| 4096usize << (k % 10);
+        for _ in 0..4000 {
+            if next(3) == 0 {
+                let n = size(next(10)) + next(4096);
+                let (a, b) = (pool_take(&mut sorted, n), take_scanning(&mut scanned, n));
+                assert_eq!(a.as_ref().map(Vec::capacity), b.as_ref().map(Vec::capacity), "asked for {n}");
+            } else {
+                let n = size(next(10));
+                pool_put(&mut sorted, Vec::with_capacity(n));
+                scanned.push(Vec::with_capacity(n));
+                scanned.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
+                // As `give_back` keeps at most so many.
+                sorted.truncate(64);
+                scanned.truncate(64);
+            }
+            assert!(sorted.windows(2).all(|w| w[0].capacity() >= w[1].capacity()), "sorted");
+            let mut caps: Vec<usize> = scanned.iter().map(Vec::capacity).collect();
+            caps.sort_unstable_by(|a, b| b.cmp(a));
+            assert_eq!(sorted.iter().map(Vec::capacity).collect::<Vec<_>>(), caps, "the same buffers kept");
+        }
+    }
 }
 
 const NOT_WATCHED: u8 = 2;
@@ -1861,6 +1951,7 @@ static BACK_CLASS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 /// where the card does the search (`VICTORY_CARD_BUFFERS_MIN_MB`); a
 /// window outside buffers cannot as the code stands.
 pub(crate) fn back_line(frames: f64) {
+    cold_skip_line(frames);
     let c: Vec<f64> = BACK_CLASS.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     if c.iter().all(|&v| v == 0.0) {
         return;
@@ -3205,9 +3296,11 @@ impl Shadow {
             len,
             copied: Mutex::new(vec![0; pages as usize]),
             ranged: Mutex::default(),
+            verified: Mutex::default(),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             flights: Mutex::default(),
+            has_pending: Default::default(),
             before: Mutex::default(),
             merging: RwLock::default(),
             kept: Mutex::default(),
@@ -3285,6 +3378,7 @@ impl Shadow {
         // lists).
         if self.card.is_some() {
             pending.push(range);
+            self.has_pending.store(true, Ordering::Release);
             return;
         }
         // The parts no declared range holds yet: their bytes are taken now,
@@ -3309,6 +3403,7 @@ impl Shadow {
             parts = rest;
         }
         pending.push(range);
+        self.has_pending.store(true, Ordering::Release);
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
@@ -3598,6 +3693,9 @@ impl Shadow {
         } else {
             pending.retain(|r| !ranges.contains(r));
         }
+        if pending.is_empty() {
+            self.has_pending.store(false, Ordering::Release);
+        }
         if !pending.is_empty() || self.card.is_some() {
             return;
         }
@@ -3655,13 +3753,29 @@ impl Shadow {
     /// Whether shaders of a submission not yet copied back may be writing
     /// the copy.
     pub(crate) fn writes_pending(&self) -> bool {
-        !self.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        self.has_pending.load(Ordering::Acquire)
     }
 
     /// Whether one of those submissions may be writing in title memory
     /// `[from, to)`.
     pub(crate) fn writes_pending_in(&self, from: usize, to: usize) -> bool {
-        self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
+        self.has_pending.load(Ordering::Acquire)
+            && self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
+    }
+
+    /// The ranges of `pending` that meet `[from, to)`, cut to it; no lock
+    /// taken when it has none (`has_pending`).
+    fn pending_in(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
+        if !self.has_pending.load(Ordering::Acquire) {
+            return Vec::new();
+        }
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|&&(a, e)| a < to && e > from)
+            .map(|&(a, e)| (a.max(from), e.min(to)))
+            .collect()
     }
 
     /// Whether [`Shadow::update`] of `[address, address + len)` would leave
@@ -3681,14 +3795,7 @@ impl Shadow {
         if from >= to {
             return false;
         }
-        let busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter(|&&(a, e)| a < to && e > from)
-            .map(|&(a, e)| (a.max(from), e.min(to)))
-            .collect();
+        let busy: Vec<(usize, usize)> = self.pending_in(from, to);
         if busy.is_empty() {
             return false;
         }
@@ -3725,14 +3832,7 @@ impl Shadow {
         if from >= to {
             return false;
         }
-        let busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter(|&&(a, e)| a < to && e > from)
-            .map(|&(a, e)| (a.max(from), e.min(to)))
-            .collect();
+        let busy: Vec<(usize, usize)> = self.pending_in(from, to);
         if busy.is_empty() {
             return false;
         }
@@ -3849,9 +3949,16 @@ impl Shadow {
             drop(merging);
             {
                 let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                // With `VICTORY_COLD_SKIP`: `now` may be older than a walk's
+                // note of the page since `stale` was read, so what the copy
+                // keeps of its chunk is forgotten (`crate::cold_skip::forget`).
+                let mut verified = crate::cold_skip::kept().then(|| self.verified.lock().unwrap_or_else(|e| e.into_inner()));
                 for page in taken {
                     if let Some(at) = copied.get_mut(page - base) {
                         *at = now;
+                        if let Some(verified) = verified.as_mut() {
+                            crate::cold_skip::forget(verified, base, page);
+                        }
                     }
                 }
             }
@@ -3971,14 +4078,18 @@ impl Shadow {
         if from >= to {
             return 0;
         }
-        let mut busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .copied()
-            .filter(|&(a, e)| a < to && e > from)
-            .collect();
+        // (No lock when there is nothing pending, as for most copies.)
+        let mut busy: Vec<(usize, usize)> = if !self.has_pending.load(Ordering::Acquire) {
+            Vec::new()
+        } else {
+            self.pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .copied()
+                .filter(|&(a, e)| a < to && e > from)
+                .collect()
+        };
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
@@ -4015,7 +4126,7 @@ impl Shadow {
             return false;
         }
         // Around ranges shaders are writing the refresh asks gap by gap.
-        if self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from) {
+        if self.has_pending.load(Ordering::Acquire) && self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from) {
             return false;
         }
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
@@ -4040,11 +4151,15 @@ impl Shadow {
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+            // With `VICTORY_COLD_SKIP`: the chunks' marks, read with the pages.
+            let mut marks = Vec::new();
+            let skip = crate::cold_skip::on();
+            let answer = if skip { crate::watch::writes_marked(from, to, true, &mut marks) } else { crate::watch::writes(from, to, true) };
+            if let Some((now, written)) = answer {
                 // (A range whose blocks rest after a write has no guard now.)
                 let guarded = crate::watch::guarded(from, to) || self.watched.load(Ordering::Relaxed) == GUARDED;
                 self.watched.store(if guarded { GUARDED } else { 1 }, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written);
+                let copied = if skip { self.copy_stale_cold(from, to, now, &written, &marks) } else { self.copy_stale(from, to, now, &written) };
                 self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]
                 {
@@ -4177,6 +4292,103 @@ impl Shadow {
         if let Some((first, known)) = run {
             runs.push(((first * PAGE).max(from), ((last + 1) * PAGE).min(to), known));
         }
+        let runs = by_parts(runs, &again_at, &crate::watch::parts_written(&again_at));
+        let bytes = self.take_all(runs);
+        if crate::watch::light() {
+            // All of the range is in the copy as of this asking.
+            let mut ranged = self.ranged.lock().unwrap_or_else(|e| e.into_inner());
+            ranged[0] = (from, to, now);
+            if to - from >= ranged[1].1 - ranged[1].0 {
+                ranged[1] = (from, to, now);
+            }
+        }
+        bytes
+    }
+
+    /// [`Shadow::copy_stale`] with `VICTORY_COLD_SKIP` (`crate::cold_skip`):
+    /// `marks`, the marks of the range's 2 MiB chunks, read with `written`
+    /// under one hold of the journal. A chunk with no note since a walk left
+    /// every page of it fresh is passed over; the same pages are copied as by
+    /// [`Shadow::copy_stale`], which this follows line for line otherwise.
+    ///
+    /// From fxceless/victory-fork pull request 1358 (TG0000). Fresh is judged
+    /// by `copied` alone, never by `ranged`: a page only partly in a range
+    /// taken whole is fresh for that range and not for a wider one, and a
+    /// chunk remembered for it would be passed over by the wider one.
+    fn copy_stale_cold(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)], marks: &[(usize, u64)]) -> usize {
+        let base = self.start as usize / PAGE;
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let mut verified = self.verified.lock().unwrap_or_else(|e| e.into_inner());
+        let pages = base..base + copied.len();
+        let mut chunks = crate::cold_skip::Chunks::new(&mut verified, pages, marks);
+        let mut writes = written.iter().peekable();
+        let ranged = if crate::watch::light() { self.ranged(from, to) } else { 0 };
+        let (mut runs, mut run) = (Vec::new(), None::<(usize, bool)>);
+        // Pages taken before and written since: in the order of their runs.
+        let mut again_at: Vec<(usize, u64)> = Vec::new();
+        let (mut walked, mut passed) = (0u64, 0u64);
+        let last = (to - 1) / PAGE;
+        for span in crate::cold_skip::spans(from / PAGE, last) {
+            if chunks.unchanged(&span) {
+                // None of these is stale: a run of stale pages ends where they start.
+                if let Some((first, known)) = run.take() {
+                    runs.push(((first * PAGE).max(from), (span.start * PAGE).min(to), known));
+                }
+                passed += span.len() as u64;
+                continue;
+            }
+            walked += span.len() as u64;
+            let mut all_fresh = true;
+            for page in span.clone() {
+                // (The entries of chunks passed over are passed over too.)
+                while writes.peek().is_some_and(|w| w.0 < page) {
+                    writes.next();
+                }
+                let write = match writes.peek() {
+                    Some(&&(p, w)) if p == page => {
+                        writes.next();
+                        w
+                    }
+                    _ => 0,
+                };
+                let at = &mut copied[page - base];
+                let taken = (*at).max(ranged);
+                if taken == 0 || write > taken {
+                    // A page only partly in the range is copied in part: it
+                    // stays stale for the rest.
+                    let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+                    if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                        *at = now;
+                    }
+                    // Cut where pages taken before meet pages never taken.
+                    let again = taken != 0;
+                    if again {
+                        again_at.push((page, taken));
+                    }
+                    if let Some((first, known)) = run
+                        && known != again
+                    {
+                        runs.push(((first * PAGE).max(from), (page * PAGE).min(to), known));
+                        run = None;
+                    }
+                    run.get_or_insert((page, again));
+                } else if let Some((first, known)) = run.take() {
+                    runs.push(((first * PAGE).max(from), (page * PAGE).min(to), known));
+                }
+                // Still stale by its own note (taken in part, written after
+                // the asking that stands, or fresh only by `ranged`): its
+                // chunk stays walked.
+                all_fresh &= crate::cold_skip::fresh(copied[page - base], write);
+            }
+            chunks.walked(&span, all_fresh);
+        }
+        // Cut to the range: next to it shaders may be writing the copy.
+        if let Some((first, known)) = run {
+            runs.push(((first * PAGE).max(from), ((last + 1) * PAGE).min(to), known));
+        }
+        drop(verified);
+        COLD_SKIP[0].fetch_add(walked, Ordering::Relaxed);
+        COLD_SKIP[1].fetch_add(passed, Ordering::Relaxed);
         let runs = by_parts(runs, &again_at, &crate::watch::parts_written(&again_at));
         let bytes = self.take_all(runs);
         if crate::watch::light() {
@@ -4981,6 +5193,7 @@ mod land_tests {
             return; // no host GPU
         };
         shadow.pending.lock().unwrap().push((title, title + LEN));
+        shadow.has_pending.store(true, Ordering::Release);
         // SAFETY: committed, aligned; touched as atomics or by the landing's
         // stores of whole dwords.
         let dword = |i: usize| unsafe { &*((title + i * 4) as *const AtomicU32) };

@@ -59,6 +59,11 @@ impl Journal {
     /// (a bit each). The asking that found it written before (0: none).
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
         let before = self.written.insert(page, now).unwrap_or(0);
+        // The only place a page is noted written: its chunk's mark moves
+        // with it (`VICTORY_COLD_SKIP`, `crate::cold_skip`).
+        if crate::cold_skip::kept() {
+            self.marks.note(page);
+        }
         if parts == WHOLE || !parts_on() {
             self.parts.remove(&page);
             return before;
@@ -119,8 +124,12 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
 }
 
 struct Journal {
-    /// Page number → the asking that last found it written.
+    /// Page number → the asking that last found it written. Changed by
+    /// [`Journal::note`] alone.
     written: BTreeMap<usize, u64>,
+    /// With `VICTORY_COLD_SKIP`: the marks of its 2 MiB chunks, moved by
+    /// every note (`crate::cold_skip`).
+    marks: crate::cold_skip::Marks,
     /// The same for each of a page's sixteen parts ([`KERNEL_PAGE`]), where
     /// the parts are known ([`parts_on`]); a page that is not here was
     /// written whole, as far as anyone knows.
@@ -144,6 +153,7 @@ struct Journal {
 /// it, found it waiting for that lock (run pooloff1).
 static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
     written: BTreeMap::new(),
+    marks: crate::cold_skip::Marks::new(),
     parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
     ahead: Vec::new(),
     ahead_asked: 0,
@@ -314,28 +324,31 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// submissions refresh thousands of host copies (6,664 askings a frame,
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
-pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+pub(crate) fn ask_ahead(ranges: impl IntoIterator<Item = (usize, usize)>) {
     ask_ahead_held(ranges, false);
 }
 
 /// [`ask_ahead`]; `held`: the caller holds everything ([`Asking::hold_all`]).
-fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
+fn ask_ahead_held(ranges: impl IntoIterator<Item = (usize, usize)>, held: bool) {
+    // The submission's one asking stands ([`ask_once`]): what it does not
+    // hold is left to `writes`. Looked at first (ZigZagBoi1/ScarlettPort
+    // 23870346; the same in XaviFortes/VIctory-RDNA 56638976): the ranges
+    // were gathered, looked up and sorted to be dropped here, and the
+    // callers' iterators are not even run now.
+    if journal().kept {
+        return;
+    }
     let mut pieces: Vec<(usize, usize)> = ranges
-        .iter()
+        .into_iter()
         // Not view memory known by its bits: the kernel would refuse the
         // asking (and, asked together with others, theirs).
         .filter(|r| r.0 < r.1 && !published(r.0, r.1) && !refused_as_view(r.0, r.1))
-        .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
+        .map(|(start, end)| (start / PAGE, end.div_ceil(PAGE)))
         .collect();
     if pieces.len() < 2 {
         return;
     }
     pieces.sort_unstable();
-    // The submission's one asking stands ([`ask_once`]): what it does not
-    // hold is left to `writes`.
-    if journal().kept {
-        return;
-    }
     let _all = (!held).then(Asking::hold_all);
     let (mut asked, mut written) = (Vec::new(), Vec::new());
     let mut i = 0;
@@ -561,7 +574,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     // other threads' askings again (0.5 ms a time, run fills-ab3), and no
     // other asking comes between the two parts.
     let _all = Asking::hold_all();
-    ask_ahead_held(ranges, true);
+    ask_ahead_held(ranges.iter().copied(), true);
     spent.next("asking: the rest");
     ask_rest(ranges, true);
     spent.end();
@@ -690,11 +703,30 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    writes_with(start, end, guarded, None)
+}
+
+/// [`writes`], with the marks of the range's 2 MiB chunks put into `marks`,
+/// read under the same hold of the journal as the pages (`VICTORY_COLD_SKIP`,
+/// `crate::cold_skip`).
+pub(crate) fn writes_marked(start: usize, end: usize, guarded: bool, marks: &mut Vec<(usize, u64)>) -> Option<(u64, Vec<(usize, u64)>)> {
+    writes_with(start, end, guarded, Some(marks))
+}
+
+/// [`writes`]; `marks`: filled as [`writes_marked`] says, if given.
+fn writes_with(start: usize, end: usize, guarded: bool, mut marks: Option<&mut Vec<(usize, u64)>>) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let of = |j: &Journal| -> Vec<(usize, u64)> { j.written.range(first..last).map(|(&p, &w)| (p, w)).collect() };
+    let of = |j: &Journal, marks: Option<&mut Vec<(usize, u64)>>| -> Vec<(usize, u64)> {
+        if let Some(marks) = marks {
+            j.marks.read(first, last, marks);
+        }
+        j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()
+    };
     // Asked ahead with the submission's other ranges: the journal has it.
-    let ahead = |j: &Journal| j.ahead.iter().any(|&(a, b)| a <= first && last <= b).then(|| (j.ahead_asked, of(j)));
-    if let Some(known) = ahead(&journal()) {
+    let ahead = |j: &Journal, marks: Option<&mut Vec<(usize, u64)>>| {
+        j.ahead.iter().any(|&(a, b)| a <= first && last <= b).then(|| (j.ahead_asked, of(j, marks)))
+    };
+    if let Some(known) = ahead(&journal(), marks.as_deref_mut()) {
         return Some(known);
     }
     // Read-only since an asking noted it: the bits first, then the journal.
@@ -705,7 +737,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             crate::faultbook::note(crate::faultbook::What::Known, first, last, 0);
         }
         let j = journal();
-        return Some((next_asking(), of(&j)));
+        return Some((next_asking(), of(&j, marks.as_deref_mut())));
     }
     // Renderer port #6: view memory, which the kernel would refuse, and the
     // caller does not ask the guards (textures, which then guard by a way of
@@ -716,7 +748,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     // Asked, and the answer noted, with the range held: nothing else asks
     // about any of it in between.
     let _range = Asking::hold(first, last);
-    if let Some(known) = ahead(&journal()) {
+    if let Some(known) = ahead(&journal(), marks.as_deref_mut()) {
         return Some(known);
     }
     let mut guards_asked = false;
@@ -764,7 +796,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     if pages.is_empty() {
         // Nothing to note: the others may go on reading.
         let j = journal();
-        return Some((next_asking(), of(&j)));
+        return Some((next_asking(), of(&j, marks.as_deref_mut())));
     }
     let answer = {
         let mut j = journal_mut();
@@ -772,7 +804,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         for &(page, parts) in &pages {
             j.note(page, parts, now);
         }
-        (now, of(&j))
+        (now, of(&j, marks.as_deref_mut()))
     };
     // Noted: what the guards made clean of it is known by its bits from
     // now on. (The range is still held: no other asking of any of it came
@@ -3278,6 +3310,7 @@ mod parts_tests {
     fn the_parts_of_a_page_written_since_it_was_taken() {
         let mut j = Journal {
             written: BTreeMap::new(),
+            marks: crate::cold_skip::Marks::new(),
             parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
             ahead: Vec::new(),
             ahead_asked: 0,
@@ -3687,11 +3720,13 @@ mod tests {
         assert_ne!(p, 0);
         // One range: `ask_ahead` leaves it.
         let ranges = [(p, p + 4 * PAGE)];
-        ask_ahead(&ranges);
+        ask_ahead(ranges);
         let (copied, _) = writes(p, p + 4 * PAGE, false).expect("watched");
         // SAFETY: committed pages of ours.
         unsafe { ((p + PAGE) as *mut u8).write_volatile(1) };
         ask_rest(&ranges, false);
+        // The asking stands: another plan's ranges are not even looked at.
+        ask_ahead(std::iter::from_fn(|| panic!("a kept asking must not consume another range plan")));
         let last = journal().written.get(&(p / PAGE + 1)).copied();
         ask_once_end();
         assert!(last.is_some_and(|last| last > copied), "{last:?} is not after {copied}");
