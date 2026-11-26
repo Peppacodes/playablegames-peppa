@@ -2380,6 +2380,137 @@ struct CardRange {
     picked: bool,
 }
 
+/// Whether a submission's compares on the card are joined per copy
+/// (`VICTORY_COMPARE_JOIN=1`; off by default; flips with the in-run A/B in
+/// diagnostics builds): declared ranges of one copy whose pieces are the
+/// same or touch share one pass and one result dword per piece, instead of
+/// a pass per range.
+///
+/// From DoubleGhosty's public tree, commit f2dd4508 (`compact_card_compares`).
+/// The ranges' bytes are not widened: each range keeps its own span, so
+/// what is fetched and landed is cut to it as before; only where its
+/// results lie (`at`) moves. A piece is hashed whole either way, so two
+/// ranges in one piece read the same flag; with the relay (compare mode 2,
+/// which stores the new hash as it compares) the second pass over a shared
+/// piece no longer compares against the hash the first just stored. Ranges
+/// only looked at (`picked`) keep passes of their own, after the declared
+/// ones as before, since they leave the hashes as they are.
+fn compare_join() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_COMPARE_JOIN") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_COMPARE_JOIN"))
+}
+
+/// One compare pass on the card with [`compare_join`]: pieces of one copy
+/// that touch, from result dword `at` on.
+struct CardCompareRun {
+    shadow: std::sync::Arc<crate::shadow::Shadow>,
+    span: crate::shadow::CardSpan,
+    at: u32,
+    picked: bool,
+}
+
+/// The compared ones of `ranges`, joined per copy (and per `picked`) into
+/// runs of pieces that touch, their results from dword `first` on; each
+/// range's `at` is set to where its first piece's result lies in its run.
+/// Returns the runs, in the order their copies first come in `ranges`, and
+/// the dword after the last result.
+fn join_card_compares(ranges: &mut [CardRange], first: u32) -> (Vec<CardCompareRun>, u32) {
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut by_copy = ByCopy::<usize>::default();
+    for (i, range) in ranges.iter().enumerate().filter(|(_, r)| r.compared) {
+        // A copy is aligned: its lowest bit is free for `picked`.
+        let key = std::sync::Arc::as_ptr(&range.shadow) as usize | usize::from(range.picked);
+        let group = *by_copy.entry(key).or_insert_with(|| {
+            groups.push(Vec::new());
+            groups.len() - 1
+        });
+        groups[group].push(i);
+    }
+    let mut runs: Vec<CardCompareRun> = Vec::new();
+    let mut at = first;
+    for group in groups {
+        let from = runs.len();
+        let spans = crate::shadow::joined_piece_runs(group.iter().map(|&i| ranges[i].span).collect());
+        let (shadow, picked) = (ranges[group[0]].shadow.clone(), ranges[group[0]].picked);
+        for span in spans {
+            runs.push(CardCompareRun { shadow: shadow.clone(), span, at, picked });
+            at += span.pieces;
+        }
+        let joined = &runs[from..];
+        for i in group {
+            let range = &mut ranges[i];
+            let run = &joined[joined.partition_point(|run| run.span.first <= range.span.first) - 1];
+            debug_assert!(range.span.first + range.span.pieces <= run.span.first + run.span.pieces);
+            range.at = run.at + (range.span.first - run.span.first);
+        }
+    }
+    (runs, at)
+}
+
+/// One compare pass over `span` of `shadow`'s copy into the results from
+/// dword `at` on (`Host::card_before`'s recording).
+///
+/// # Safety
+/// As [`card_pass`]'s, with the compare's root signature, pipeline and
+/// result buffer set.
+unsafe fn compare_pass(list: &ID3D12GraphicsCommandList, shadow: &crate::shadow::Shadow, span: &crate::shadow::CardSpan, at: u32, mode: u32) {
+    let (Some((_, Some(before), _)), size) = (shadow.card_sides(), shadow.card_hash_size()) else {
+        return;
+    };
+    // SAFETY: the caller's; live buffers of the copy.
+    unsafe {
+        list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
+        list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
+        card_pass(list, span, size as u32, at, mode);
+    }
+    CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod compare_join_tests {
+    use super::*;
+
+    fn range(shadow: &std::sync::Arc<crate::shadow::Shadow>, from: usize, to: usize, picked: bool, compared: bool) -> CardRange {
+        CardRange { shadow: shadow.clone(), declared: (from, to), span: shadow.card_run(from, to), at: u32::MAX, compared, picked }
+    }
+
+    #[test]
+    fn shared_pieces_share_a_result_and_nothing_is_widened() {
+        let a = crate::shadow::Shadow::unbacked(0x7a10_0000, std::ptr::null_mut(), 4 * 65536, false);
+        let b = crate::shadow::Shadow::unbacked(0x7b10_0000, std::ptr::null_mut(), 4 * 65536, false);
+        let mut ranges = vec![
+            range(&a, 64, 80, false, true),
+            range(&a, 4096, 4112, false, true),
+            range(&a, 65536 + 128, 65536 + 144, false, true),
+            range(&a, 3 * 65536 + 64, 3 * 65536 + 80, false, true),
+            range(&b, 64, 80, false, true),
+            range(&a, 64, 80, true, true),
+            range(&a, 2 * 65536, 2 * 65536 + 16, false, false),
+        ];
+        let before: Vec<_> = ranges.iter().map(|r| (r.declared, r.span)).collect();
+        let (runs, end) = join_card_compares(&mut ranges, 17);
+        // a: pieces 0-1 and 3; b: piece 0; a looked at: piece 0.
+        assert_eq!(runs.len(), 4);
+        assert_eq!(end, 17 + 2 + 1 + 1 + 1);
+        assert_eq!(ranges[0].at, ranges[1].at);
+        assert_eq!(ranges[2].at, ranges[0].at + 1);
+        assert_ne!(ranges[4].at, ranges[0].at, "other copies keep results of their own");
+        assert_ne!(ranges[5].at, ranges[0].at, "what is only looked at keeps passes of its own");
+        assert_eq!(ranges[6].at, u32::MAX, "what is not compared is not given results");
+        assert_eq!(ranges.iter().map(|r| (r.declared, r.span)).collect::<Vec<_>>(), before);
+        assert!(
+            !runs.iter().filter(|r| std::sync::Arc::ptr_eq(&r.shadow, &a) && !r.picked).any(|r| r.span.first <= 2 && 2 < r.span.first + r.span.pieces),
+            "no piece is added"
+        );
+        assert!(runs.iter().position(|r| r.picked) > runs.iter().position(|r| std::sync::Arc::ptr_eq(&r.shadow, &b)));
+        assert_eq!(join_card_compares(&mut [], 29).1, 29);
+    }
+}
+
 impl CardPlan {
     /// `crate::picked` is told where what it looked at changed, by the
     /// compare's results.
@@ -4879,6 +5010,13 @@ impl Host {
                 at += span.pieces;
             }
         }
+        // (`VICTORY_COMPARE_JOIN`) The same ranges, fewer passes: their
+        // results take no more dwords than above, so they fit as they did.
+        let joined = compare_join().then(|| {
+            let (runs, end) = join_card_compares(&mut plan.ranges, work.taken);
+            at = end;
+            runs
+        });
         work.taken = at;
         if plan.ranges.iter().any(|r| r.compared) {
             let Some(check) = work.check.pop().or_else(|| self.make_prelude()) else {
@@ -4905,7 +5043,12 @@ impl Host {
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
-                    for r in plan.ranges.iter().filter(|r| r.compared) {
+                    if let Some(runs) = &joined {
+                        for r in runs {
+                            compare_pass(list, &r.shadow, &r.span, r.at, if flown && !r.picked { 2 } else { 1 });
+                        }
+                    }
+                    for r in plan.ranges.iter().filter(|r| r.compared && joined.is_none()) {
                         let (Some((_, Some(before), _)), size) = (r.shadow.card_sides(), r.shadow.card_hash_size()) else {
                             continue;
                         };
@@ -9595,8 +9738,10 @@ impl Meter {
             if passes + compares > 0.0 {
                 tracing::info!(
                     "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after \
-                     ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes",
-                    if rehash_runs() { "on" } else { "off" }
+                     ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes \
+                     (VICTORY_COMPARE_JOIN=1 joins them per copy: now {})",
+                    if rehash_runs() { "on" } else { "off" },
+                    if compare_join() { "on" } else { "off" }
                 );
             }
         }
