@@ -1323,6 +1323,7 @@ mod relay_tests {
 }
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
+/// Kept sorted by capacity, largest first ([`pool_take`], [`pool_put`]).
 static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
 /// An empty buffer with room for `n` bytes, from the pool if it has one
@@ -1331,19 +1332,29 @@ static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 /// reserved (1.4 GB in run 24).
 fn pooled(n: usize) -> Vec<u8> {
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    let most = n.saturating_mul(4).max(1 << 20);
-    let fit = pool
-        .iter()
-        .enumerate()
-        .filter(|(_, v)| v.capacity() >= n && v.capacity() <= most)
-        .min_by_key(|(_, v)| v.capacity())
-        .map(|(i, _)| i);
-    let mut v = match fit {
-        Some(i) => pool.swap_remove(i),
-        None => Vec::with_capacity(n),
-    };
+    let mut v = pool_take(&mut pool, n).unwrap_or_else(|| Vec::with_capacity(n));
     v.clear();
     v
+}
+
+/// Of `pool` (sorted, largest first): the smallest buffer with room for `n`
+/// bytes and no more than four times that (or 1 MiB), taken out; the pool
+/// stays sorted. One binary search, where the whole pool (up to 1,024) was
+/// looked through under the lock (Marvisak/VIctory pull request 3384,
+/// borosf).
+fn pool_take(pool: &mut Vec<Vec<u8>>, n: usize) -> Option<Vec<u8>> {
+    let most = n.saturating_mul(4).max(1 << 20);
+    // Largest first: the ones with room end where the first without begins,
+    // and the one before it is the smallest with room.
+    let i = pool.partition_point(|v| v.capacity() >= n).checked_sub(1)?;
+    (pool[i].capacity() <= most).then(|| pool.remove(i))
+}
+
+/// `v` into `pool` (sorted, largest first), where it keeps the pool sorted:
+/// the place a stable sort of the pool with `v` at its end gives it.
+fn pool_put(pool: &mut Vec<Vec<u8>>, v: Vec<u8>) {
+    let at = pool.partition_point(|b| b.capacity() >= v.capacity());
+    pool.insert(at, v);
 }
 
 /// How many snapshot buffers are kept (`VICTORY_SNAPSHOT_POOL`; `8`: as
@@ -1366,8 +1377,8 @@ fn snapshots_kept() -> usize {
 fn give_back(v: Vec<u8>) {
     const KEPT: usize = 512 << 20;
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    pool.push(v);
-    pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
+    // (Sorted as it is kept: no sort of the whole pool at every return.)
+    pool_put(&mut pool, v);
     let (mut kept, mut total) = (0, 0usize);
     for v in pool.iter().take(snapshots_kept()) {
         total = total.saturating_add(v.capacity());
@@ -1380,6 +1391,57 @@ fn give_back(v: Vec<u8>) {
     let gone = pool.split_off(kept);
     drop(pool);
     drop(gone);
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::{pool_put, pool_take};
+
+    /// As `pooled` and `give_back` chose before the pool was kept sorted: a
+    /// scan for the smallest with room, a sort at every return.
+    fn take_scanning(pool: &mut Vec<Vec<u8>>, n: usize) -> Option<Vec<u8>> {
+        let most = n.saturating_mul(4).max(1 << 20);
+        let fit = pool
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v.capacity() >= n && v.capacity() <= most)
+            .min_by_key(|(_, v)| v.capacity())
+            .map(|(i, _)| i)?;
+        Some(pool.swap_remove(fit))
+    }
+
+    #[test]
+    fn the_pool_stays_sorted_and_gives_what_the_scan_gave() {
+        let (mut sorted, mut scanned): (Vec<Vec<u8>>, Vec<Vec<u8>>) = (Vec::new(), Vec::new());
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x % n) as usize
+        };
+        // Sizes from 4 KiB to 2 MiB, many alike.
+        let size = |k: usize| 4096usize << (k % 10);
+        for _ in 0..4000 {
+            if next(3) == 0 {
+                let n = size(next(10)) + next(4096);
+                let (a, b) = (pool_take(&mut sorted, n), take_scanning(&mut scanned, n));
+                assert_eq!(a.as_ref().map(Vec::capacity), b.as_ref().map(Vec::capacity), "asked for {n}");
+            } else {
+                let n = size(next(10));
+                pool_put(&mut sorted, Vec::with_capacity(n));
+                scanned.push(Vec::with_capacity(n));
+                scanned.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
+                // As `give_back` keeps at most so many.
+                sorted.truncate(64);
+                scanned.truncate(64);
+            }
+            assert!(sorted.windows(2).all(|w| w[0].capacity() >= w[1].capacity()), "sorted");
+            let mut caps: Vec<usize> = scanned.iter().map(Vec::capacity).collect();
+            caps.sort_unstable_by(|a, b| b.cmp(a));
+            assert_eq!(sorted.iter().map(Vec::capacity).collect::<Vec<_>>(), caps, "the same buffers kept");
+        }
+    }
 }
 
 const NOT_WATCHED: u8 = 2;
