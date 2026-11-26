@@ -448,6 +448,13 @@ pub(crate) fn line_on() -> bool {
     behind::on()
 }
 
+/// The host lists of the submissions ready at the head of the line
+/// ([`behind::ready_runs`]); none without the line.
+#[cfg(windows)]
+pub(crate) fn ready_runs() -> Vec<usize> {
+    if behind::on() { behind::ready_runs() } else { Vec::new() }
+}
+
 /// Lists in the line may have been translated ([`crate::list::thin`]).
 #[cfg(windows)]
 pub(crate) fn line_moved() {

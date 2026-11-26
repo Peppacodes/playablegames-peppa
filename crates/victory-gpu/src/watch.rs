@@ -555,6 +555,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     if !once() {
         return;
     }
+    ASKINGS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     let mut spent = crate::timeline::span("asking: ahead");
     ask_once_end();
     // Both parts under one hold of everything: a second hold waited for the
@@ -608,6 +609,28 @@ fn ask_rest(ranges: &[(usize, usize)], held: bool) {
     j.ahead = ahead;
 }
 
+/// Askings made ([`ask_once`]) and our writes to title memory ([`wrote`])
+/// since the start: `crate::host::split` takes an asking made ahead only if
+/// neither moved since.
+static ASKINGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WROTE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The number of the last asking begun.
+pub(crate) fn asking_epoch() -> u64 {
+    ASKINGS.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Whether the asking numbered `epoch` is the last one and still stands.
+pub(crate) fn asking_stands(epoch: u64) -> bool {
+    let j = journal_mut();
+    j.kept && ASKINGS.load(std::sync::atomic::Ordering::Acquire) == epoch
+}
+
+/// Our writes to title memory noted so far ([`wrote`]).
+pub(crate) fn wrote_count() -> u64 {
+    WROTE.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// The submission's one asking stands no longer: its refreshes are done,
 /// or title memory was written in a way the journal was not told.
 pub(crate) fn ask_once_end() {
@@ -622,6 +645,7 @@ pub(crate) fn ask_once_end() {
 /// stands (the title's buffer copies, done at submission): its pages count
 /// as written after that asking, so the refreshes that follow copy them.
 pub(crate) fn wrote(at: usize, len: usize) {
+    WROTE.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     let mut j = journal_mut();
     if !j.kept || len == 0 {
         return;
