@@ -4,7 +4,8 @@
 //! n is on in the phases whose number has bit n, so that all combinations
 //! come one after another, again and again. Each phase's frame times are
 //! logged at its end (the frames of its first second left out). A switch
-//! named here does not go by its own variable any more.
+//! named here does not go by its own variable any more. `<a>+<b>` names
+//! several switches that share one bit (a bundle flipped as one).
 
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 use std::sync::{Mutex, OnceLock};
@@ -36,7 +37,12 @@ pub(crate) fn pick(switch: &str) -> Option<bool> {
 
 /// The number of `switch` among those that change.
 pub(crate) fn bit(switch: &str) -> Option<u32> {
-    Some(asked()?.switches.iter().position(|s| s == switch)? as u32)
+    Some(position(&asked()?.switches, switch)? as u32)
+}
+
+/// Which of `switches` holds `switch`, alone or in a `<a>+<b>` bundle.
+fn position(switches: &[String], switch: &str) -> Option<usize> {
+    switches.iter().position(|s| s.split('+').any(|part| part == switch))
 }
 
 /// Whether the switch of that number is on now.
@@ -105,8 +111,10 @@ pub(crate) fn presented(change: impl Fn(&str, bool, bool)) {
         p.frames.len(),
         p.draws as f64 / p.frames.len().max(1) as f64
     );
-    for (n, switch) in asked.switches.iter().enumerate() {
-        change(switch, was >> n & 1 != 0, will >> n & 1 != 0);
+    for (n, switches) in asked.switches.iter().enumerate() {
+        for switch in switches.split('+') {
+            change(switch, was >> n & 1 != 0, will >> n & 1 != 0);
+        }
     }
     BITS.store(will, Relaxed);
     (p.number, p.began, p.draws) = (number, now, 0);
@@ -127,5 +135,12 @@ mod tests {
         assert_eq!(summary(&mut [30.0, 10.0, 20.0]), (20.0, 20.0, 30.0));
         assert_eq!(summary(&mut []), (0.0, 0.0, 0.0));
         assert_eq!(pick("VICTORY_NONE_SUCH"), None);
+        let bundle = parse("10,VICTORY_A,VICTORY_B+VICTORY_C").unwrap().switches;
+        assert_eq!(bundle.len(), 2);
+        assert_eq!(position(&bundle, "VICTORY_A"), Some(0));
+        assert_eq!(position(&bundle, "VICTORY_B"), Some(1));
+        assert_eq!(position(&bundle, "VICTORY_C"), Some(1));
+        assert_eq!(position(&bundle, "VICTORY_B+VICTORY_C"), None);
+        assert_eq!(position(&bundle, "VICTORY_D"), None);
     }
 }
