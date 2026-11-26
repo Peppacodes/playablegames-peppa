@@ -3481,6 +3481,24 @@ pub(crate) fn settle_for_fence() {
     settle_now(WHY_FENCE);
 }
 
+/// The ranges a submission's one write-watch asking is about
+/// (`VICTORY_ASK_ONCE`): per copy asked ahead, the span of its refreshed
+/// ranges in `runs`' deferred steps.
+fn asked_spans(runs: &[&HostList]) -> Vec<(usize, usize)> {
+    let mut spans: ByCopy<(usize, usize)> = ByCopy::default();
+    for list in runs {
+        for step in &list.deferred().copies {
+            if let Step::Refresh(shadow, address, len) = step
+                && shadow.asked_ahead()
+            {
+                let span = spans.entry(std::sync::Arc::as_ptr(shadow) as usize).or_insert((*address, *address + *len));
+                *span = (span.0.min(*address), span.1.max(*address + *len));
+            }
+        }
+    }
+    spans.into_values().collect()
+}
+
 /// Resets the host lists of settled flights and keeps them for reuse, as
 /// a queue does for the lists it ran (`crate::list::recycle`).
 fn land() {
@@ -3857,6 +3875,9 @@ fn late_line(frames: f64) {
     if !late() {
         return;
     }
+    if split_ahead::on() || split_ahead::STATS[0].load(Ordering::Relaxed) > 0 {
+        tracing::info!("{}", split_ahead::line());
+    }
     let s: Vec<f64> = LATE_STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
         "submissions sent ahead per frame: {:.1} in {:.1} settles ({:.1} flights each time), {:.1} ms waiting for the card in them; \
@@ -3991,6 +4012,8 @@ mod upq;
 pub(crate) use send::{goes_as_words, words_under};
 #[cfg(feature = "diagnostics")]
 pub(crate) mod spans;
+#[path = "host/split.rs"]
+mod split_ahead;
 mod torn;
 #[cfg(feature = "diagnostics")]
 mod traffic;
@@ -5944,24 +5967,14 @@ impl Host {
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
-            let mut spans: ByCopy<(usize, usize)> = ByCopy::default();
-            for list in runs {
-                for step in &list.deferred().copies {
-                    if let Step::Refresh(shadow, address, len) = step
-                        && shadow.asked_ahead()
-                    {
-                        let span = spans
-                            .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                            .or_insert((*address, *address + *len));
-                        *span = (span.0.min(*address), span.1.max(*address + *len));
-                    }
-                }
-            }
-            let ranges: Vec<(usize, usize)> = spans.into_values().collect();
+            let ranges = asked_spans(runs);
             #[cfg(feature = "diagnostics")]
             SPLIT[8].fetch_add(split.so_far(), Ordering::Relaxed);
             stage.next("submit: asking the write watch");
-            crate::watch::ask_once(&ranges);
+            // Or the asking made ahead stands for it (`VICTORY_SUBMIT_SPLIT`).
+            if !split_ahead::asked_for(runs, &ranges, own.is_some()) {
+                crate::watch::ask_once(&ranges);
+            }
             #[cfg(feature = "diagnostics")]
             split.part(0);
             stage.next("submit: title bytes under flights' writes");
@@ -6009,6 +6022,9 @@ impl Host {
         stage.next("submit: the last refreshes");
         batch.flush();
         crate::watch::ask_once_end();
+        // The next submission's asking, ahead, beside what is left of this
+        // one (`VICTORY_SUBMIT_SPLIT`).
+        split_ahead::after_own_asking();
         #[cfg(feature = "diagnostics")]
         split.part(2);
         stage.next("submit: snapshots");
@@ -6614,6 +6630,12 @@ impl Host {
 }
 
 impl HostList {
+    /// Who it is, whoever holds it now (its allocator, which stays with it
+    /// when it is taken off its title list).
+    pub(crate) fn id(&self) -> usize {
+        windows::core::Interface::as_raw(&self.allocator) as usize
+    }
+
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
     fn stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {

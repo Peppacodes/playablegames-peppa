@@ -179,6 +179,20 @@ pub(crate) fn tables_done(lists: &[This]) {
 
 /// The host list behind a title list, if there is a host GPU.
 #[cfg(windows)]
+/// Every host list of title list `this`: the parts cut at its waits, then
+/// the last (for an asking made ahead, `crate::host`'s split). Valid while
+/// the list stays as it is (in the line, until the thread that serves it
+/// takes it).
+#[cfg(windows)]
+pub(crate) fn hosts_of<'a>(this: This) -> Vec<&'a crate::host::HostList> {
+    if this.is_null() {
+        return Vec::new();
+    }
+    // SAFETY: one of our lists.
+    let list = unsafe { &*this.cast::<List>() };
+    list.earlier.iter().map(|p| &p.host).chain(list.host.as_ref()).collect()
+}
+
 pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
     if this.is_null() {
         return None;

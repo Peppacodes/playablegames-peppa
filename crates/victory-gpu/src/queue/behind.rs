@@ -593,6 +593,40 @@ impl Work for Job {
 
 static LANE: Lane<Job> = Lane::new();
 
+/// The host lists (addresses) of the submissions that stand first in their
+/// queue in the line, with nothing in front of them (no wait), for an asking
+/// made ahead (`crate::host::split`). They stay in the line until the thread
+/// that serves it takes them.
+pub(super) fn ready_runs() -> Vec<usize> {
+    let state = LANE.lock();
+    // Per queue, its entries from the first one on, up to the first that is
+    // not a submission ready to go (a wait, a present, lists still being
+    // translated): those behind it are joined to it when it goes.
+    let mut stopped: Vec<usize> = Vec::new();
+    let mut lists = Vec::new();
+    for e in &state.items {
+        if stopped.contains(&e.queue) {
+            continue;
+        }
+        match &e.what {
+            Job::Run(_, detached, _) | Job::Joined(_, detached, ..) => {
+                lists.extend(detached.iter().map(|d| std::ptr::from_ref(d.host()) as usize));
+            }
+            // A submission whose lists are translated, not unfolded yet: its
+            // host lists are still on its lists of ours.
+            Job::Lists(_, recordings) if recordings.iter().all(|r| r.done()) => {
+                for r in recordings.iter() {
+                    lists.extend(crate::list::hosts_of(r.back()).into_iter().map(|h| std::ptr::from_ref(h) as usize));
+                }
+            }
+            // A signal goes along (as when joined).
+            Job::Signal(..) => {}
+            _ => stopped.push(e.queue),
+        }
+    }
+    lists
+}
+
 /// Submissions and presents in the line that have not been given to the host
 /// yet.
 static QUEUED: AtomicU64 = AtomicU64::new(0);
