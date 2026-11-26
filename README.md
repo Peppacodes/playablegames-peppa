@@ -1,11 +1,10 @@
 # playablegames-peppa
 
-**The game's world works on NVIDIA at nearly 20 fps, confirmed on an RTX 5080
+**The game's world works on NVIDIA at over 21 fps, confirmed on an RTX 5080
 (2026-11-27).** This tree runs the game's own executable,
 `game_scarlett_master.exe` (build 1.0.2.1, an Xbox Series title), from the
 user's own copy: from a save into the open world, in-game and playable with a
-controller, at 18.7 fps held over a 12 minute run standing in a house interior
-and 20.2 fps with one experimental switch.
+controller, at 21.7 fps held over a 12 minute run standing in a house interior.
 
 | Milestone | Status |
 |---|---|
@@ -13,9 +12,9 @@ and 20.2 fps with one experimental switch.
 | In the world, from a save | Works |
 | Playable with a controller | Works: a 55 minute session without a crash |
 | Story progress | First missions: the first mission completed, side tasks completed, and driving around the world by day and by night (the owner's own play) |
-| Performance | 18.7 fps average over 12 minutes in a house interior, on a named PC: RTX 5080 16 GB, Ryzen 7 5700X3D, 32 GB RAM, Windows 11 (20.2 with one experimental switch); the goal is 30 |
+| Performance | 21.7 fps average over 12 minutes in a house interior, on a named PC: RTX 5080 16 GB, Ryzen 7 5700X3D, 32 GB RAM, Windows 11; the goal is 30 |
 | Rendering | Lit and whole, with known faults; ray tracing is off |
-| Stability | A 55 minute session without a crash; a night of 61 scripted runs with no lost device and no driver error; memory flat at about 26 GB |
+| Stability | A 55 minute session without a crash; a night of 61 scripted runs with no lost device and no driver error; memory steady at about 27 GB |
 
 That is on an NVIDIA RTX 5080 with 32 GB of RAM. Figures, method and known
 faults: [Where it stands](#where-it-stands-2026-11-27).
@@ -48,22 +47,28 @@ after the driver had finished compiling shaders.
 
 | Build and settings | ms a frame (median) | fps |
 |---|---|---|
-| This tree with `Play-VIctory.cmd`'s settings, a 12 minute run | 53.5 (p10 51.2, p90 55.5) | 18.7 |
-| The same + `VICTORY_SKIP_WC_BACK=1 VICTORY_SKIP_WC_KEEP=65536` (an experiment, see below), a 12 minute run | 49.5 (p10 46.9, p90 52.2) | 20.2 |
+| This tree with `Play-VIctory.cmd`'s settings, a 12 minute run | 46.0 (p10 43.9, p90 47.6) | 21.7 |
+| The same before the allocator change and the copy-back skip (pull request 17), a 12 minute run | 53.5 (p10 51.2, p90 55.5) | 18.7 |
 | The same code before the five switches and the 2026-11-27 changes (pull requests 1, 2 and 4), four runs | 68-113 | 9-15 |
 | The tree as it was on 2026-11-25 (Series S with the title's FidelityFX upscaler), two runs | 138.0, 138.8 | 7.2 |
 
 How to read these. They are one PC's figures. The same build lands on different
-medians from load to load (three 4 minute runs of the first row: 56.3, 50.0 and
-58.2 ms), so each switch was judged inside one run, flipped every 10 s
+medians from load to load (three 4 minute runs of the second row's build: 56.3,
+50.0 and 58.2 ms), so each switch was judged inside one run, flipped every 10 s
 (`VICTORY_AB=<seconds>,<SWITCH>`, diagnostics builds), over 5 to 11 cycles. The
-GPU crate's unit tests run with `cargo test -p victory-gpu --lib`: 414 pass, and
-four known ones fail (two of them on the base tree too). The
-process holds about 26 GB of private memory, flat over 12 minutes. Earlier figures (2026-11-26, Series X, the first room):
+GPU crate's unit tests run with
+`cargo test -p victory-gpu --lib --features "diagnostics mimalloc"`: 427 pass,
+and four known ones fail (two of them on the base tree too). The
+process holds about 27 GB of private memory, steady over 12 minutes. Earlier figures (2026-11-26, Series X, the first room):
 61-67 ms for this tree against 77.3 for avatarmanz's on the same PC.
 
-The five switches the launcher now sets, all measured on this card with the
-in-run A/B:
+The Rust side of the layer allocates through mimalloc, not the Windows process
+heap it shared with the title and the driver. It is on by default in the build
+(`VICTORY_ALLOC=system` goes back for one run): 5.6 ms off the median over two
+alternated pairs of runs, 4 ms of it in the time the layer spends preparing a
+frame.
+
+The switches the launcher sets, all measured on this card with the in-run A/B:
 
 | Switch | What it does | Effect |
 |---|---|---|
@@ -72,21 +77,26 @@ in-run A/B:
 | `VICTORY_PORT_GUARD=1` | The write guards' lock is shared by faults and refreshes | -3 to -4 ms |
 | `VICTORY_LAND_ASIDE=1` | Landed lists are reset on a thread of their own | -2 to -4 ms |
 | `VICTORY_PLACED_ORDER=1` | A copy at its place in a list holds back the card's steps only if they stand behind it, not the whole submission | -2 ms |
+| `VICTORY_SKIP_WC_BACK=1` with `VICTORY_SKIP_WC_KEEP=1048576` | What shaders wrote to write-combining title memory stays on the card; declared ranges up to 1 MiB are still fetched back | -3.9 ms, in 44 of 44 cycles |
 
-`VICTORY_SKIP_WC_BACK=1` with `VICTORY_SKIP_WC_KEEP=65536` leaves what shaders
-wrote to write-combining title memory on the card, except ranges up to 64 KiB
-(the title reads its exposure back from such a range). It is an experiment: where
-the title's CPU code writes part of a piece the card wrote, stale bytes could go
-up. Twelve minutes of captures showed no fault. Without the second switch the
-picture is wrong (overexposed, blocks).
+About the last row: the 1 MiB keep is there because the title's CPU code reads
+small ranges back (its exposure, counts and visibility lists); without the
+second switch the picture is wrong (overexposed, blocks). Where the title's CPU
+code writes part of a larger piece the card wrote, stale bytes could go up; none
+showed in the captures of five runs, the longest 12 minutes. The 1 MiB figure
+comes from Zignixx's RTX 5080 write-up in fxceless/victory-fork issue 1379.
 
 What sets the frame now: one thread of ours, the one that prepares each
 submission of the title's work for the card. It is busy the whole frame, and the
-title, the list threads and the card (about 18 of 55 ms) all wait for it. Tried
-on this card without a gain, so that nobody has to again: `VICTORY_PORT_CONSTANTS`
-(the card then reads the constants over the bus: 126 ms a frame),
-`VICTORY_PORT_DESCRIPTORS`, a thin-LTO AVX2 build, 6 or 12 list threads instead
-of 8, `VICTORY_LANE_CORE`, `VICTORY_CARD_BUFFERS_MIN_KB=256`.
+title, the list threads and the card (about 18 ms of the frame) all wait for it.
+Tried on this card without a gain, so that nobody has to again:
+`VICTORY_PORT_CONSTANTS` (the card then reads the constants over the bus: 126 ms
+a frame), `VICTORY_PORT_DESCRIPTORS`, a thin-LTO AVX2 build, 6 or 12 list threads
+instead of 8, `VICTORY_LANE_CORE`, `VICTORY_CARD_BUFFERS_MIN_KB=256`,
+`VICTORY_VIEW_BYTES=0`, `VICTORY_COLD_SKIP=1` with `VICTORY_FEED_ONE_CALL=1`
+(0.6 ms together; both are in the tree, off), and two ways of giving that thread
+a helper thread (draft pull requests 13 and 16: 7 and 2 ms slower, because the
+processor is already near full).
 
 What is known to be wrong or missing on NVIDIA:
 
@@ -133,7 +143,7 @@ $env:VICTORY_GAME_DIR = 'D:\Games\MyDump'    # your own dump, outside this folde
 ```
 
 The launcher picks the Series S profile and the settings the figures above were
-measured with (the title's own upscaler at 2/3 scale, the five switches, card
+measured with (the title's own upscaler at 2/3 scale, the measured switches, card
 buffers and pipeline settings from the RTX 4080 recipe in avatarmanz's issue
 143), and keeps its shader cache under `%LOCALAPPDATA%\VIctory\cache-pareto`. A
 setting you set yourself before starting it wins. If the title's own watchdog
@@ -193,7 +203,13 @@ Results, bug reports and pull requests are all welcome.
   (ESAT586); fxceless pull requests 868 (Chipsraine: the census and the
   write-combining copy-back experiment), 1224 (Steenax6: `VICTORY_BURY_ASIDE`)
   and 1146 (beamdotdev: `VICTORY_LAND_ASIDE`); avatarmanz's renderer patches
-  (`VICTORY_PORT_CONSTANTS`, `VICTORY_PORT_DESCRIPTORS`, `VICTORY_PORT_GUARD`).
+  (`VICTORY_PORT_CONSTANTS`, `VICTORY_PORT_DESCRIPTORS`, `VICTORY_PORT_GUARD`);
+  trustno1-coder/VIctory-NVIDIA pull request 11 (Dastano: mimalloc); fxceless
+  pull requests 1358 (TG0000: `VICTORY_COLD_SKIP`) and 1137
+  (`VICTORY_FEED_ONE_CALL`); Marvisak/VIctory pull request 3384 (borosf: the
+  sorted snapshot pool); and two small changes after ZigZagBoi1's and
+  XaviFortes's public trees (`ask_ahead` returning early, a lock-free
+  `has_pending`).
   Written here: the card copies' scans narrowed to the copies touched,
   `VICTORY_SKIP_WC_KEEP`, and timeline diagnostics that sample every thread
   (`VICTORY_TIMELINE_ALL`, `VICTORY_TIMELINE_FAST`).
