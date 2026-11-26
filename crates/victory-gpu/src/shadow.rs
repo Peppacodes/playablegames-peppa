@@ -48,6 +48,10 @@ pub(crate) struct Shadow {
     /// a range holds in part cannot say so in `copied`. Locked inside
     /// `copied`'s lock.
     ranged: Mutex<[(usize, usize, u64); 2]>,
+    /// With `VICTORY_COLD_SKIP`: per 2 MiB chunk, the journal's mark when a
+    /// walk last left it fresh (`crate::cold_skip::Chunks`); empty before the
+    /// first such walk. Locked inside `copied`'s lock.
+    verified: Mutex<Vec<u64>>,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
@@ -304,6 +308,25 @@ pub(crate) fn card_room_kept() -> u64 {
     // play-1125-0127: 1,453 passes refused, the ground and people black).
     const SEEN: u64 = 1 << 30;
     card_limits().1.min(SEEN).saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
+}
+
+/// With `VICTORY_COLD_SKIP` on (`crate::cold_skip::on`), since the last
+/// line: pages looked at one by one, pages passed over. A page counts once
+/// for each refresh whose range holds it.
+static COLD_SKIP: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// With the frame-rate line, if a refresh went by `VICTORY_COLD_SKIP`.
+fn cold_skip_line(frames: f64) {
+    let [walked, passed] = [0, 1].map(|i| COLD_SKIP[i].swap(0, Ordering::Relaxed));
+    if walked + passed == 0 {
+        return;
+    }
+    tracing::info!(
+        "refreshes with VICTORY_COLD_SKIP per frame: {:.0} pages of 64 KiB passed over, {:.0} looked at ({:.1}% passed over)",
+        passed as f64 / frames,
+        walked as f64 / frames,
+        passed as f64 * 100.0 / (walked + passed) as f64
+    );
 }
 
 /// The copies in the card's memory.
@@ -1861,6 +1884,7 @@ static BACK_CLASS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 /// where the card does the search (`VICTORY_CARD_BUFFERS_MIN_MB`); a
 /// window outside buffers cannot as the code stands.
 pub(crate) fn back_line(frames: f64) {
+    cold_skip_line(frames);
     let c: Vec<f64> = BACK_CLASS.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     if c.iter().all(|&v| v == 0.0) {
         return;
@@ -3205,6 +3229,7 @@ impl Shadow {
             len,
             copied: Mutex::new(vec![0; pages as usize]),
             ranged: Mutex::default(),
+            verified: Mutex::default(),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             flights: Mutex::default(),
@@ -3849,9 +3874,16 @@ impl Shadow {
             drop(merging);
             {
                 let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                // With `VICTORY_COLD_SKIP`: `now` may be older than a walk's
+                // note of the page since `stale` was read, so what the copy
+                // keeps of its chunk is forgotten (`crate::cold_skip::forget`).
+                let mut verified = crate::cold_skip::kept().then(|| self.verified.lock().unwrap_or_else(|e| e.into_inner()));
                 for page in taken {
                     if let Some(at) = copied.get_mut(page - base) {
                         *at = now;
+                        if let Some(verified) = verified.as_mut() {
+                            crate::cold_skip::forget(verified, base, page);
+                        }
                     }
                 }
             }
@@ -4040,11 +4072,15 @@ impl Shadow {
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+            // With `VICTORY_COLD_SKIP`: the chunks' marks, read with the pages.
+            let mut marks = Vec::new();
+            let skip = crate::cold_skip::on();
+            let answer = if skip { crate::watch::writes_marked(from, to, true, &mut marks) } else { crate::watch::writes(from, to, true) };
+            if let Some((now, written)) = answer {
                 // (A range whose blocks rest after a write has no guard now.)
                 let guarded = crate::watch::guarded(from, to) || self.watched.load(Ordering::Relaxed) == GUARDED;
                 self.watched.store(if guarded { GUARDED } else { 1 }, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written);
+                let copied = if skip { self.copy_stale_cold(from, to, now, &written, &marks) } else { self.copy_stale(from, to, now, &written) };
                 self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]
                 {
@@ -4177,6 +4213,103 @@ impl Shadow {
         if let Some((first, known)) = run {
             runs.push(((first * PAGE).max(from), ((last + 1) * PAGE).min(to), known));
         }
+        let runs = by_parts(runs, &again_at, &crate::watch::parts_written(&again_at));
+        let bytes = self.take_all(runs);
+        if crate::watch::light() {
+            // All of the range is in the copy as of this asking.
+            let mut ranged = self.ranged.lock().unwrap_or_else(|e| e.into_inner());
+            ranged[0] = (from, to, now);
+            if to - from >= ranged[1].1 - ranged[1].0 {
+                ranged[1] = (from, to, now);
+            }
+        }
+        bytes
+    }
+
+    /// [`Shadow::copy_stale`] with `VICTORY_COLD_SKIP` (`crate::cold_skip`):
+    /// `marks`, the marks of the range's 2 MiB chunks, read with `written`
+    /// under one hold of the journal. A chunk with no note since a walk left
+    /// every page of it fresh is passed over; the same pages are copied as by
+    /// [`Shadow::copy_stale`], which this follows line for line otherwise.
+    ///
+    /// From fxceless/victory-fork pull request 1358 (TG0000). Fresh is judged
+    /// by `copied` alone, never by `ranged`: a page only partly in a range
+    /// taken whole is fresh for that range and not for a wider one, and a
+    /// chunk remembered for it would be passed over by the wider one.
+    fn copy_stale_cold(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)], marks: &[(usize, u64)]) -> usize {
+        let base = self.start as usize / PAGE;
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let mut verified = self.verified.lock().unwrap_or_else(|e| e.into_inner());
+        let pages = base..base + copied.len();
+        let mut chunks = crate::cold_skip::Chunks::new(&mut verified, pages, marks);
+        let mut writes = written.iter().peekable();
+        let ranged = if crate::watch::light() { self.ranged(from, to) } else { 0 };
+        let (mut runs, mut run) = (Vec::new(), None::<(usize, bool)>);
+        // Pages taken before and written since: in the order of their runs.
+        let mut again_at: Vec<(usize, u64)> = Vec::new();
+        let (mut walked, mut passed) = (0u64, 0u64);
+        let last = (to - 1) / PAGE;
+        for span in crate::cold_skip::spans(from / PAGE, last) {
+            if chunks.unchanged(&span) {
+                // None of these is stale: a run of stale pages ends where they start.
+                if let Some((first, known)) = run.take() {
+                    runs.push(((first * PAGE).max(from), (span.start * PAGE).min(to), known));
+                }
+                passed += span.len() as u64;
+                continue;
+            }
+            walked += span.len() as u64;
+            let mut all_fresh = true;
+            for page in span.clone() {
+                // (The entries of chunks passed over are passed over too.)
+                while writes.peek().is_some_and(|w| w.0 < page) {
+                    writes.next();
+                }
+                let write = match writes.peek() {
+                    Some(&&(p, w)) if p == page => {
+                        writes.next();
+                        w
+                    }
+                    _ => 0,
+                };
+                let at = &mut copied[page - base];
+                let taken = (*at).max(ranged);
+                if taken == 0 || write > taken {
+                    // A page only partly in the range is copied in part: it
+                    // stays stale for the rest.
+                    let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+                    if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                        *at = now;
+                    }
+                    // Cut where pages taken before meet pages never taken.
+                    let again = taken != 0;
+                    if again {
+                        again_at.push((page, taken));
+                    }
+                    if let Some((first, known)) = run
+                        && known != again
+                    {
+                        runs.push(((first * PAGE).max(from), (page * PAGE).min(to), known));
+                        run = None;
+                    }
+                    run.get_or_insert((page, again));
+                } else if let Some((first, known)) = run.take() {
+                    runs.push(((first * PAGE).max(from), (page * PAGE).min(to), known));
+                }
+                // Still stale by its own note (taken in part, written after
+                // the asking that stands, or fresh only by `ranged`): its
+                // chunk stays walked.
+                all_fresh &= crate::cold_skip::fresh(copied[page - base], write);
+            }
+            chunks.walked(&span, all_fresh);
+        }
+        // Cut to the range: next to it shaders may be writing the copy.
+        if let Some((first, known)) = run {
+            runs.push(((first * PAGE).max(from), ((last + 1) * PAGE).min(to), known));
+        }
+        drop(verified);
+        COLD_SKIP[0].fetch_add(walked, Ordering::Relaxed);
+        COLD_SKIP[1].fetch_add(passed, Ordering::Relaxed);
         let runs = by_parts(runs, &again_at, &crate::watch::parts_written(&again_at));
         let bytes = self.take_all(runs);
         if crate::watch::light() {

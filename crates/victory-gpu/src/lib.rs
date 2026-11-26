@@ -21,6 +21,8 @@ mod ambient;
 mod capture;
 #[cfg(windows)]
 mod compose;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod cold_skip;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
