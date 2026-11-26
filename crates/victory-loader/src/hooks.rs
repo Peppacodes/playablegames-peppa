@@ -164,7 +164,12 @@ fn parse_scale(text: &str) -> Option<f32> {
 pub(crate) unsafe fn resolution_levers(base: usize, hash: &blake3::Hash) -> usize {
     let scale = std::env::var(RENDER_SCALE_ENV).ok();
     let own = std::env::var_os(OWN_UPSCALER_ENV).is_some_and(|v| v != "0");
-    if scale.is_none() && !own {
+    // These levers act only with the own upscaler forced
+    // (`VICTORY_OWN_UPSCALER=1`, the set the RTX 4080 recipe runs). Without
+    // it `VICTORY_RENDER_SCALE` belongs to `crate::resolution` (avatarmanz:
+    // the own upscaler's scale alone, with `VICTORY_OUTPUT` and
+    // `VICTORY_UPSCALER` beside it), so that the two never patch one place.
+    if !own {
         return 0;
     }
     // Every image the loader maps comes here (the title's DLLs too); only

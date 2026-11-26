@@ -469,6 +469,18 @@ const TARGETS: u64 = after(13);
 const CLEAR_RTV: u64 = after(14);
 const CLEAR_DSV: u64 = after(15);
 const COPY_TEXTURE: u64 = after(16);
+const UPSCALE: u64 = after(17);
+
+/// Writes the title's upscale down with the list's calls (`super::upscale`);
+/// false if the list has no recording being written.
+pub(super) fn upscale(this: This, up: &super::Upscale) -> bool {
+    let front = front(this);
+    if front.closed || front.recording.is_none() {
+        return false;
+    }
+    front.put(UPSCALE, &(*up).to_words());
+    true
+}
 
 /// The bytes of `count` things at `items` (none if null).
 fn bytes_of<'a, T>(items: *const T, count: usize) -> &'a [u8] {
@@ -779,6 +791,14 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
                     at(w, 2 + 2 * step, boxed),
                 );
             }
+            UPSCALE => {
+                if let Some(up) = super::Upscale::from_words(w)
+                    && !super::upscale_now(list, &up)
+                {
+                    static TOLD: std::sync::Once = std::sync::Once::new();
+                    TOLD.call_once(|| tracing::warn!("a written-down upscale could not be recorded: its output stays as it is"));
+                }
+            }
             _ => {}
         }
     }
@@ -906,6 +926,7 @@ mod tests {
         let mut slot = [0x5256_5476u64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
         let kept = record(slot.as_ptr() as u64);
         slot[1] = 99;
+        assert_eq!(slot[1], 99);
         assert_eq!(kept[1], 2);
         assert_eq!(record(0), [0; RECORD]);
     }

@@ -12,6 +12,7 @@ victory-core.workspace = true
 victory-pe.workspace = true
 victory-loader.workspace = true
 victory-hle.workspace = true
+victory-gpu.workspace = true
 victory-shader = { workspace = true, features = ["host"] }
 victory-game.workspace = true
 anyhow.workspace = true
@@ -19,8 +20,14 @@ blake3.workspace = true
 memchr.workspace = true
 clap.workspace = true
 walkdir.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [features]
+# NVIDIA DLSS for the title's upscale (VICTORY_UPSCALE=dlss); needs VICTORY_DLSS_SDK.
+dlss = ["victory-gpu/dlss"]
 # Debug-level logs and the debugging switches (frame capture, stack dumps,
 # the host debug layer, scripted keys). Off in a plain release build.
 diagnostics = [
