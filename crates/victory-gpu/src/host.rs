@@ -8394,6 +8394,10 @@ struct Batch {
     /// Copies (by address) brought up to date ahead of the steps, and the
     /// range (from, to) ([`Batch::refresh_ahead`]).
     ahead: ByCopy<(usize, usize)>,
+    /// The entry of `ahead` last looked up (copy, from, to); copy 0: none.
+    /// Refreshes of one copy come one after another; this saves their
+    /// lookups. Forgotten whenever `ahead` changes ([`Batch::forget_ahead`]).
+    last_ahead: (usize, usize, usize),
     /// `ahead` holds everything the submission refreshes
     /// ([`Batch::refresh_front`]).
     front: bool,
@@ -8825,8 +8829,16 @@ impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
-        if self.ahead.get(&key).is_some_and(|&(from, to)| from <= address && end <= to) {
+        // (From XaviFortes/VIctory-RDNA commit 56638976: the same answer as
+        // the lookup, which it saves while one copy's refreshes follow.)
+        if self.last_ahead.0 == key && self.last_ahead.1 <= address && end <= self.last_ahead.2 {
             return;
+        }
+        if let Some(&(from, to)) = self.ahead.get(&key) {
+            self.last_ahead = (key, from, to);
+            if from <= address && end <= to {
+                return;
+            }
         }
         match self.index.get(&key) {
             Some(&at) => {
@@ -8847,6 +8859,7 @@ impl Batch {
         // is in front of all the steps was, up to here.)
         if !self.front {
             self.ahead.remove(&(std::sync::Arc::as_ptr(shadow) as usize));
+            self.forget_ahead();
         }
         let Some(at) = self.index.remove(&(std::sync::Arc::as_ptr(shadow) as usize)) else {
             return;
@@ -8894,7 +8907,13 @@ impl Batch {
         self.flush();
         crate::shadow::stamps_expire();
         self.ahead.clear();
+        self.forget_ahead();
         self.textures.clear();
+    }
+
+    /// `ahead` changed: [`Batch::last_ahead`] may not hold any more.
+    fn forget_ahead(&mut self) {
+        self.last_ahead = (0, 0, 0);
     }
 
     /// Before the steps of `runs` ([`refresh_front`]), a new part of the
@@ -8989,6 +9008,7 @@ impl Batch {
         for (shadow, from, to) in &spans {
             self.ahead.insert(std::sync::Arc::as_ptr(shadow) as usize, (*from, *to));
         }
+        self.forget_ahead();
         #[cfg(feature = "diagnostics")]
         {
             FLUSHES[0].fetch_add(1, Ordering::Relaxed);
@@ -9071,6 +9091,7 @@ impl Batch {
         for (shadow, from, to) in &due {
             self.ahead.insert(std::sync::Arc::as_ptr(shadow) as usize, (*from, *to));
         }
+        self.forget_ahead();
         #[cfg(feature = "diagnostics")]
         let began = std::time::Instant::now();
         let started = std::time::Instant::now();
