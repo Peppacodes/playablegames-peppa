@@ -324,28 +324,31 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// submissions refresh thousands of host copies (6,664 askings a frame,
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
-pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+pub(crate) fn ask_ahead(ranges: impl IntoIterator<Item = (usize, usize)>) {
     ask_ahead_held(ranges, false);
 }
 
 /// [`ask_ahead`]; `held`: the caller holds everything ([`Asking::hold_all`]).
-fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
+fn ask_ahead_held(ranges: impl IntoIterator<Item = (usize, usize)>, held: bool) {
+    // The submission's one asking stands ([`ask_once`]): what it does not
+    // hold is left to `writes`. Looked at first (ZigZagBoi1/ScarlettPort
+    // 23870346; the same in XaviFortes/VIctory-RDNA 56638976): the ranges
+    // were gathered, looked up and sorted to be dropped here, and the
+    // callers' iterators are not even run now.
+    if journal().kept {
+        return;
+    }
     let mut pieces: Vec<(usize, usize)> = ranges
-        .iter()
+        .into_iter()
         // Not view memory known by its bits: the kernel would refuse the
         // asking (and, asked together with others, theirs).
         .filter(|r| r.0 < r.1 && !published(r.0, r.1) && !refused_as_view(r.0, r.1))
-        .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
+        .map(|(start, end)| (start / PAGE, end.div_ceil(PAGE)))
         .collect();
     if pieces.len() < 2 {
         return;
     }
     pieces.sort_unstable();
-    // The submission's one asking stands ([`ask_once`]): what it does not
-    // hold is left to `writes`.
-    if journal().kept {
-        return;
-    }
     let _all = (!held).then(Asking::hold_all);
     let (mut asked, mut written) = (Vec::new(), Vec::new());
     let mut i = 0;
@@ -571,7 +574,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     // other threads' askings again (0.5 ms a time, run fills-ab3), and no
     // other asking comes between the two parts.
     let _all = Asking::hold_all();
-    ask_ahead_held(ranges, true);
+    ask_ahead_held(ranges.iter().copied(), true);
     spent.next("asking: the rest");
     ask_rest(ranges, true);
     spent.end();
@@ -3717,11 +3720,13 @@ mod tests {
         assert_ne!(p, 0);
         // One range: `ask_ahead` leaves it.
         let ranges = [(p, p + 4 * PAGE)];
-        ask_ahead(&ranges);
+        ask_ahead(ranges);
         let (copied, _) = writes(p, p + 4 * PAGE, false).expect("watched");
         // SAFETY: committed pages of ours.
         unsafe { ((p + PAGE) as *mut u8).write_volatile(1) };
         ask_rest(&ranges, false);
+        // The asking stands: another plan's ranges are not even looked at.
+        ask_ahead(std::iter::from_fn(|| panic!("a kept asking must not consume another range plan")));
         let last = journal().written.get(&(p / PAGE + 1)).copied();
         ask_once_end();
         assert!(last.is_some_and(|last| last > copied), "{last:?} is not after {copied}");
