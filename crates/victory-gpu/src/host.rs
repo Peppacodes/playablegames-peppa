@@ -8352,6 +8352,7 @@ fn split_line(frames: f64) {
         h[2],
         aside::WAITED.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames,
     );
+    sparse_line(frames);
 }
 
 /// Whether a submission's refreshes of host copies run on several threads,
@@ -8459,6 +8460,84 @@ struct Batch {
     /// `ahead` holds everything the submission refreshes
     /// ([`Batch::refresh_front`]).
     front: bool,
+    /// [`sparse_refresh`], read at the batch's first refresh and kept for
+    /// it (the in-run A/B may flip it meanwhile).
+    sparse_on: Option<bool>,
+    /// With [`sparse_refresh`]: per copy (by address) in `refreshes`, its
+    /// refreshes as spans apart ([`sparse_add`]), the entry's range being
+    /// their union; empty: too many, the union is refreshed. A copy refreshed
+    /// once has none.
+    sparse: ByCopy<Vec<(usize, usize)>>,
+}
+
+/// Whether a copy's refreshes in a batch are kept as spans apart, up to
+/// [`SPARSE_MOST`] of them joined where they come within [`SPARSE_GAP`], and
+/// not as one range from the lowest to the highest
+/// (`VICTORY_SPARSE_REFRESH=1`; off by default).
+///
+/// From fxceless/victory-fork pull request 1406 by spk-c (and the same idea
+/// in DexNom/VIctory pull request 20 by Batushn): what lies between far-apart
+/// refreshes of a copy is neither walked page by page, nor asked of the write
+/// watch, nor copied (a copy that is not write-watched is copied whole over
+/// its range). Upstream kept it to copies not write-watched; here it is for
+/// every copy of [`Batch::add`] (the pages between are not asked for by any
+/// list of the batch, and stay as stale as they were; a later refresh of
+/// them finds them so). What is not changed: the refreshes in front
+/// ([`Batch::refresh_front`], `ahead`), which keep one range a copy.
+fn sparse_refresh() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_SPARSE_REFRESH") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SPARSE_REFRESH").is_some_and(|v| v == "1"))
+}
+
+/// [`sparse_refresh`]: refreshes this close are one span.
+const SPARSE_GAP: usize = 64 << 10;
+/// [`sparse_refresh`]: more spans than this and the copy's union is refreshed.
+const SPARSE_MOST: usize = 8;
+
+/// With [`sparse_refresh`], since the last frame line: copies refreshed by
+/// spans apart, the bytes between their spans left out, copies whose spans
+/// became too many.
+static SPARSE_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// `[from, to)` into `spans` (in order, each more than [`SPARSE_GAP`] from
+/// the next), joined with those it comes within the gap of. Whether there
+/// are at most [`SPARSE_MOST`].
+fn sparse_add(spans: &mut Vec<(usize, usize)>, from: usize, to: usize) -> bool {
+    // The first that ends within the gap before `from`, or later.
+    let at = spans.partition_point(|s| s.1.saturating_add(SPARSE_GAP) < from);
+    let (mut lo, mut hi) = (from, to);
+    let mut end = at;
+    while end < spans.len() && spans[end].0 <= to.saturating_add(SPARSE_GAP) {
+        lo = lo.min(spans[end].0);
+        hi = hi.max(spans[end].1);
+        end += 1;
+    }
+    spans.splice(at..end, [(lo, hi)]);
+    spans.len() <= SPARSE_MOST
+}
+
+/// The bytes between `spans` (in order): what their union holds besides.
+fn sparse_gaps(spans: &[(usize, usize)]) -> u64 {
+    spans.windows(2).map(|w| w[1].0.saturating_sub(w[0].1) as u64).sum()
+}
+
+/// The frame line of [`sparse_refresh`].
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+fn sparse_line(frames: f64) {
+    let s: Vec<f64> = SPARSE_STATS.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    if sparse_refresh() {
+        tracing::info!(
+            "refreshes kept as spans apart per frame (VICTORY_SPARSE_REFRESH=1): {:.0} copies, {:.1} MB between their spans \
+             left out, {:.0} copies with more than {SPARSE_MOST} spans (their union refreshed)",
+            s[0],
+            s[1] / 1048576.0,
+            s[2],
+        );
+    }
 }
 
 /// Whether the copies that a submission's shaders write are brought up to
@@ -8912,6 +8991,15 @@ impl Batch {
         match self.index.get(&key) {
             Some(&at) => {
                 let r = &mut self.refreshes[at];
+                // `VICTORY_SPARSE_REFRESH`: the spans apart too; the range
+                // stays their union.
+                if *self.sparse_on.get_or_insert_with(sparse_refresh) {
+                    let spans = self.sparse.entry(key).or_insert_with(|| vec![(r.1, r.2)]);
+                    if !spans.is_empty() && !sparse_add(spans, address, end) {
+                        spans.clear();
+                        SPARSE_STATS[2].fetch_add(1, Ordering::Relaxed);
+                    }
+                }
                 (r.1, r.2) = (r.1.min(address), r.2.max(end));
             }
             None => {
@@ -8940,7 +9028,21 @@ impl Batch {
         }
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
-        if !(crate::watch::light() && shadow.nothing_new(from, to - from)) {
+        // `VICTORY_SPARSE_REFRESH`: span by span, what lies between left out.
+        let spans = if self.sparse.is_empty() {
+            None
+        } else {
+            self.sparse.remove(&(std::sync::Arc::as_ptr(&shadow) as usize)).filter(|s| s.len() > 1)
+        };
+        if let Some(spans) = spans {
+            SPARSE_STATS[0].fetch_add(1, Ordering::Relaxed);
+            SPARSE_STATS[1].fetch_add(sparse_gaps(&spans), Ordering::Relaxed);
+            for (from, to) in spans {
+                if !(crate::watch::light() && shadow.nothing_new(from, to - from)) {
+                    Self::update(&shadow, from, to);
+                }
+            }
+        } else if !(crate::watch::light() && shadow.nothing_new(from, to - from)) {
             Self::update(&shadow, from, to);
         }
         #[cfg(feature = "diagnostics")]
@@ -9229,6 +9331,7 @@ impl Batch {
         self.refresh_textures();
         self.index.clear();
         if self.refreshes.is_empty() {
+            self.sparse.clear();
             return;
         }
         #[cfg(feature = "diagnostics")]
@@ -9261,13 +9364,44 @@ impl Batch {
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
         }
+        // `VICTORY_SPARSE_REFRESH`: the copies refreshed by spans apart
+        // (their entries' ranges are the unions), each with more than one.
+        let sparse: ByCopy<Vec<(usize, usize)>> = if self.sparse.is_empty() {
+            ByCopy::default()
+        } else {
+            let mut sparse = std::mem::take(&mut self.sparse);
+            sparse.retain(|_, spans| spans.len() > 1);
+            for spans in sparse.values() {
+                SPARSE_STATS[0].fetch_add(1, Ordering::Relaxed);
+                SPARSE_STATS[1].fetch_add(sparse_gaps(spans), Ordering::Relaxed);
+            }
+            sparse
+        };
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
         let ahead = self.refreshes.len() > 1;
         if ahead {
             let started = std::time::Instant::now();
-            crate::watch::ask_ahead(self.refreshes.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)));
+            if sparse.is_empty() {
+                crate::watch::ask_ahead(self.refreshes.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)));
+            } else {
+                let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(self.refreshes.len());
+                for r in self.refreshes.iter().filter(|r| r.0.asked_ahead()) {
+                    match sparse.get(&(std::sync::Arc::as_ptr(&r.0) as usize)) {
+                        Some(spans) => ranges.extend_from_slice(spans),
+                        None => ranges.push((r.1, r.2)),
+                    }
+                }
+                crate::watch::ask_ahead(ranges);
+            }
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
+        if !sparse.is_empty() {
+            self.flush_sparse(sparse, light, beside);
+            if ahead {
+                crate::watch::ask_ahead_done();
+            }
+            return;
         }
         if wide_refresh() && self.refreshes.len() >= 4 {
             // Each copy on its own, several at a time: a copy's refresh
@@ -9307,6 +9441,84 @@ impl Batch {
         if ahead {
             crate::watch::ask_ahead_done();
         }
+    }
+
+    /// The rest of [`Batch::flush_all`] when copies are refreshed by spans
+    /// apart ([`sparse_refresh`]; `sparse`: those, by address): as there, a
+    /// copy is one job, on several threads from four copies on; its spans
+    /// are done one after the other in it. `light`, `beside`: as there.
+    fn flush_sparse(&mut self, sparse: ByCopy<Vec<(usize, usize)>>, light: bool, beside: bool) {
+        const FEW: usize = 256;
+        /// A copy's refresh: `[from, to)`, or `spans` alone; `check`: what
+        /// is known to copy nothing is left as it is.
+        fn one(shadow: &crate::shadow::Shadow, from: usize, to: usize, spans: Option<&Vec<(usize, usize)>>, check: bool) {
+            match spans {
+                Some(spans) => {
+                    for &(a, b) in spans {
+                        if !(check && shadow.nothing_new(a, b - a)) {
+                            Batch::update(shadow, a, b);
+                        }
+                    }
+                }
+                None => {
+                    if !(check && shadow.nothing_new(from, to - from)) {
+                        Batch::update(shadow, from, to);
+                    }
+                }
+            }
+        }
+        let refreshes = std::mem::take(&mut self.refreshes);
+        if wide_refresh() && refreshes.len() >= 4 {
+            // The time counted is the time it took, not the threads' sum.
+            let started = std::time::Instant::now();
+            let before = PREPARING[0].load(Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            FLUSHES[3].fetch_add(refreshes.len() as u64, Ordering::Relaxed);
+            let check = light && (refreshes.len() > FEW || beside);
+            crate::shadow::wide_each(refreshes.len(), move |i| {
+                let (shadow, from, to) = &refreshes[i];
+                one(shadow, *from, *to, sparse.get(&(std::sync::Arc::as_ptr(shadow) as usize)), check);
+            });
+            let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
+            PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
+        } else {
+            for (shadow, from, to) in &refreshes {
+                one(shadow, *from, *to, sparse.get(&(std::sync::Arc::as_ptr(shadow) as usize)), false);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod sparse_tests {
+    use super::{SPARSE_GAP, SPARSE_MOST, sparse_add, sparse_gaps};
+
+    /// Spans apart stay apart, those within the gap join, every byte asked
+    /// for is in one, and past the most the caller is told.
+    #[test]
+    fn spans_keep_every_byte_asked_and_join_within_the_gap() {
+        let mut spans = vec![(0, 16)];
+        assert!(sparse_add(&mut spans, 4 * SPARSE_GAP, 4 * SPARSE_GAP + 16));
+        assert_eq!(spans, [(0, 16), (4 * SPARSE_GAP, 4 * SPARSE_GAP + 16)]);
+        assert_eq!(sparse_gaps(&spans), (4 * SPARSE_GAP - 16) as u64);
+        // Within the gap of the first: joined to it.
+        assert!(sparse_add(&mut spans, SPARSE_GAP, SPARSE_GAP + 8));
+        assert_eq!(spans, [(0, SPARSE_GAP + 8), (4 * SPARSE_GAP, 4 * SPARSE_GAP + 16)]);
+        // Bridging both: one.
+        assert!(sparse_add(&mut spans, 2 * SPARSE_GAP, 3 * SPARSE_GAP));
+        assert_eq!(spans, [(0, 4 * SPARSE_GAP + 16)]);
+        // Before and inside.
+        let mut spans = vec![(100 * SPARSE_GAP, 100 * SPARSE_GAP + 1)];
+        assert!(sparse_add(&mut spans, 0, 1));
+        assert!(sparse_add(&mut spans, 100 * SPARSE_GAP, 100 * SPARSE_GAP + 1));
+        assert_eq!(spans, [(0, 1), (100 * SPARSE_GAP, 100 * SPARSE_GAP + 1)]);
+        // The most.
+        let mut spans = vec![(0, 1)];
+        for i in 1..SPARSE_MOST {
+            assert!(sparse_add(&mut spans, i * 4 * SPARSE_GAP, i * 4 * SPARSE_GAP + 1));
+        }
+        assert_eq!(spans.len(), SPARSE_MOST);
+        assert!(!sparse_add(&mut spans, 1000 * SPARSE_GAP, 1000 * SPARSE_GAP + 1));
     }
 }
 
