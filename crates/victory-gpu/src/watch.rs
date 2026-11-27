@@ -298,7 +298,14 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
             tally(0, 1);
             tally(1, ((last - first) * (PAGE >> 10)) as u64);
         }
-        let mut pages: Vec<(usize, u16)> = Vec::new();
+        // With the scratch switch: room for exactly the pages there are (the
+        // answer is in order), not grown push by push.
+        let room = if crate::host::scratch() {
+            found[..count].windows(2).filter(|w| w[0] / PAGE != w[1] / PAGE).count() + usize::from(count > 0)
+        } else {
+            0
+        };
+        let mut pages: Vec<(usize, u16)> = Vec::with_capacity(room);
         for &at in &found[..count] {
             let (page, part) = (at / PAGE, 1u16 << (at % PAGE / KERNEL_PAGE));
             match pages.last_mut() {
