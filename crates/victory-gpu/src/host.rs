@@ -9051,7 +9051,7 @@ impl Batch {
     /// Every container emptied (their room kept), as `Batch::default()`.
     fn clear(&mut self) {
         // Named field by field: a field added later must be emptied here too.
-        let Batch { refreshes, index, textures, due, placed, fills, ahead, front, last_ahead } = self;
+        let Batch { refreshes, index, textures, due, placed, fills, ahead, front, last_ahead, sparse_on, sparse, write_jobs_on, jobs } = self;
         refreshes.clear();
         index.clear();
         textures.clear();
@@ -9061,6 +9061,10 @@ impl Batch {
         ahead.clear();
         *front = false;
         *last_ahead = (0, 0, 0);
+        *sparse_on = None;
+        sparse.clear();
+        *write_jobs_on = None;
+        jobs.clear();
     }
 
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
