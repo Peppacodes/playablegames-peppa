@@ -1164,6 +1164,7 @@ fn page_faults() -> u64 {
 /// second or more: a 4 s frame after an unlogged 4 s frame showed two
 /// frames' counts as one's).
 pub(crate) fn log(frames: f64) {
+    memory_line();
     crate::workcensus::tick();
     {
         static TOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1458,4 +1459,40 @@ pub(crate) fn log(frames: f64) {
             us as f64 / 1e3 / frames
         );
     }
+}
+
+/// Every ten seconds: the PC's free memory and commit left, our private
+/// bytes, the card's memory in use against its budget, and the windows in
+/// card memory the CPU maps (`VICTORY_WINDOWS_BAR_MB`), so that runs can be
+/// set beside each other second by second (`tools/paircmp.sh`, `inrun.sh`).
+fn memory_line() {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = crate::host::now_ms();
+    let last = LAST.load(Relaxed);
+    if now < last + 10_000 || LAST.compare_exchange(last, now, Relaxed, Relaxed).is_err() {
+        return;
+    }
+    // SAFETY: plain data with its length set, filled by the query.
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: as above.
+    unsafe { GlobalMemoryStatusEx(&mut m) };
+    let (_, private) = process_memory();
+    let (budget, used) = crate::host::host().and_then(|h| h.video_memory()).map_or((0, 0), |[b, u, ..]| (b, u));
+    let refused: Vec<u64> = crate::shadow::WINDOW_MAPPED_REFUSED.iter().map(|r| r.load(Relaxed)).collect();
+    tracing::info!(
+        "pool memory (VICTORY_WINDOWS_BAR_MB {}): free RAM {} MB, commit left {} MB, private {} MB, card {} of {} MB in use, windows in card memory the CPU maps {} MB now {} (did not fit: {} over the budget line (VICTORY_WINDOWS_BAR_PCT), {} over the MB asked, {} refused by the host)",
+        std::env::var("VICTORY_WINDOWS_BAR_MB").unwrap_or_else(|_| "unset".into()),
+        m.ullAvailPhys >> 20,
+        m.ullAvailPageFile >> 20,
+        private >> 20,
+        used >> 20,
+        budget >> 20,
+        crate::shadow::window_mapped_bytes() >> 20,
+        crate::shadow::window_mapped_bytes() >> 20,
+        refused[0],
+        refused[1],
+        refused[2]
+    );
 }
