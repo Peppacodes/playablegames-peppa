@@ -8142,6 +8142,11 @@ impl HostList {
                     let started = std::time::Instant::now();
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
+                    } else if !batch.jobs.is_empty() {
+                        // `VICTORY_WRITE_JOBS`: it may write host copies (the
+                        // arena's): the copies' jobs are done before it.
+                        WRITE_JOB_STATS[4].fetch_add(1, Ordering::Relaxed);
+                        batch.run_jobs();
                     }
                     let _step = crate::timeline::span("a step of ours");
                     work();
@@ -8158,6 +8163,14 @@ impl HostList {
                     continue;
                 }
                 Step::GpuWrite(shadow, address, len) => {
+                    // `VICTORY_WRITE_JOBS`: both at the next flush, as the
+                    // copy's job, in this order.
+                    if batch.writes_as_jobs() {
+                        batch.defer_write(shadow, *address, *len);
+                        #[cfg(feature = "diagnostics")]
+                        add(C::GpuWrites, 1);
+                        continue;
+                    }
                     // The shaders start from the title's data: this copy's
                     // pending refresh first. The other copies' wait for
                     // the next flush of all (flushing all of them at every
@@ -8287,6 +8300,7 @@ impl Split {
 /// The split of the preparing, per frame, for the frame-rate line.
 #[cfg(feature = "diagnostics")]
 fn split_line(frames: f64) {
+    write_jobs_line(frames);
     let ms: Vec<f64> = SPLIT.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames).collect();
     let f: Vec<f64> = FLUSHES.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     let e: Vec<f64> = crate::watch::early_asks().iter().map(|&n| n as f64 / frames).collect();
@@ -8472,6 +8486,77 @@ struct Batch {
     /// their union; empty: too many, the union is refreshed. A copy refreshed
     /// once has none.
     sparse: ByCopy<Vec<(usize, usize)>>,
+    /// [`write_jobs`], read at the batch's first shader write and kept for it.
+    write_jobs_on: Option<bool>,
+    /// With [`write_jobs`]: per copy (by address), what is to be done to it
+    /// before and as its shaders are given ranges, in order, at the next
+    /// flush: one job a copy ([`Batch::run_jobs`]).
+    jobs: ByCopy<(std::sync::Arc<crate::shadow::Shadow>, Vec<WriteStep>)>,
+}
+
+/// One thing a copy's job does ([`write_jobs`]), in the order of the steps.
+enum WriteStep {
+    /// `[from, to)` brought up to date, unless known to copy nothing.
+    Refresh(usize, usize),
+    /// Shaders are given `[address, address + len)`: `Shadow::writing`.
+    Write(usize, usize),
+}
+
+/// Whether a list's step that gives shaders a range of a copy
+/// (`Step::GpuWrite`) leaves the copy's pending refresh and the note of the
+/// range (`Shadow::writing`) to the next flush of the batch, as that copy's
+/// job, in order, instead of doing both at once on the submitting thread
+/// (`VICTORY_WRITE_JOBS=1`; off by default).
+///
+/// From LooperSalty/AnyXboxX pull request 362 by Skyfrye: there those
+/// refreshes were 2.6-3.1 ms of the submitting thread over ~5,200
+/// declarations a frame, done one at a time outside the threads that run
+/// the batch's other refreshes (here: 1.8 ms a frame before 434 shader
+/// writes, and the notes themselves). A copy's job holds its refreshes and
+/// its ranges given to shaders in their order (refresh, then the range
+/// noted, then the refreshes after it); the jobs run at the flush, a copy to
+/// a thread on the wide threads from four copies on, before the batch's
+/// other refreshes (which are of other copies: a copy with a job has its
+/// later refreshes at the end of its job). What still comes first: a step
+/// that writes title memory flushes the batch (`Batch::title_written`), and
+/// a step of ours on host memory (`Step::Host`) runs the jobs before it (it
+/// may write host copies: memory.rs's arena copies).
+///
+/// Not the fork of the submit-split design (draft pull request 16, a thread
+/// of its own taking the refreshes in front beside the steps, with a hand-off
+/// per span): no new thread, nothing runs beside the submitting thread's
+/// steps; only the refreshes before shader writes, and the notes, move into
+/// the flushes that run on the wide threads already.
+fn write_jobs() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_WRITE_JOBS") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WRITE_JOBS").is_some_and(|v| v == "1"))
+}
+
+/// With [`write_jobs`], since the last frame line: shader writes left to the
+/// jobs, refreshes in them, jobs run, flushes of jobs (and those before a
+/// step of ours), microseconds the submitting thread spent in them.
+static WRITE_JOB_STATS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+/// The frame line of [`write_jobs`].
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+fn write_jobs_line(frames: f64) {
+    let s: Vec<f64> = WRITE_JOB_STATS.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    if write_jobs() {
+        tracing::info!(
+            "shader writes per frame left to copies' jobs (VICTORY_WRITE_JOBS=1): {:.0} writes, {:.0} refreshes in {:.0} jobs \
+             of {:.0} flushes ({:.0} of them before a step of ours), {:.2} ms on the submitting thread",
+            s[0],
+            s[1],
+            s[2],
+            s[3],
+            s[4],
+            s[5] / 1000.0,
+        );
+    }
 }
 
 /// Whether a copy's refreshes in a batch are kept as spans apart, up to
@@ -9058,6 +9143,97 @@ impl Batch {
         }
     }
 
+    /// Whether [`write_jobs`] is on for this batch.
+    fn writes_as_jobs(&mut self) -> bool {
+        *self.write_jobs_on.get_or_insert_with(write_jobs)
+    }
+
+    /// The pending refresh of the copy `key`, out of `refreshes` (and its
+    /// spans apart, [`sparse_refresh`]): its ranges in order.
+    fn take_refresh(&mut self, key: usize) -> Vec<(usize, usize)> {
+        let Some(at) = self.index.remove(&key) else {
+            return Vec::new();
+        };
+        let (_, from, to) = self.refreshes.swap_remove(at);
+        // The last entry took its place.
+        if let Some(moved) = self.refreshes.get(at) {
+            self.index.insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
+        }
+        match self.sparse.remove(&key) {
+            Some(spans) if spans.len() > 1 => spans,
+            _ => vec![(from, to)],
+        }
+    }
+
+    /// [`write_jobs`]: shaders are given `[address, address + len)` of
+    /// `shadow`'s copy. What [`Batch::flush_one`] and `Shadow::writing` did
+    /// here goes into the copy's job: its pending refresh, then the range.
+    fn defer_write(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
+        // From here on it is refreshed around what the shaders write (as
+        // `flush_one`: at once, for the refreshes still to be added).
+        if !self.front {
+            self.ahead.remove(&key);
+            self.forget_ahead();
+        }
+        let before = self.take_refresh(key);
+        WRITE_JOB_STATS[0].fetch_add(1, Ordering::Relaxed);
+        WRITE_JOB_STATS[1].fetch_add(before.len() as u64, Ordering::Relaxed);
+        let job = &mut self.jobs.entry(key).or_insert_with(|| (shadow.clone(), Vec::new())).1;
+        job.extend(before.into_iter().map(|(from, to)| WriteStep::Refresh(from, to)));
+        job.push(WriteStep::Write(address, len));
+    }
+
+    /// [`write_jobs`]: the copies' jobs are done, each copy's later
+    /// refreshes (noted after its last range given to shaders) at the end of
+    /// its job; on several threads from four copies on, a copy to a thread.
+    fn run_jobs(&mut self) {
+        if self.jobs.is_empty() {
+            return;
+        }
+        let _jobs = crate::timeline::span("copies' refreshes and shader writes");
+        let started = std::time::Instant::now();
+        let mut jobs: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<WriteStep>)> = std::mem::take(&mut self.jobs).into_values().collect();
+        for (shadow, steps) in &mut jobs {
+            let after = self.take_refresh(std::sync::Arc::as_ptr(shadow) as usize);
+            WRITE_JOB_STATS[1].fetch_add(after.len() as u64, Ordering::Relaxed);
+            steps.extend(after.into_iter().map(|(from, to)| WriteStep::Refresh(from, to)));
+        }
+        WRITE_JOB_STATS[2].fetch_add(jobs.len() as u64, Ordering::Relaxed);
+        WRITE_JOB_STATS[3].fetch_add(1, Ordering::Relaxed);
+        let light = crate::watch::light();
+        fn job(shadow: &crate::shadow::Shadow, steps: &[WriteStep], light: bool) {
+            for step in steps {
+                match *step {
+                    WriteStep::Refresh(from, to) => {
+                        if !(light && shadow.nothing_new(from, to - from)) {
+                            Batch::update(shadow, from, to);
+                        }
+                    }
+                    WriteStep::Write(address, len) => shadow.writing(address, len),
+                }
+            }
+        }
+        let before = PREPARING[0].load(Ordering::Relaxed);
+        if wide_refresh() && jobs.len() >= 4 {
+            crate::shadow::wide_each(jobs.len(), move |i| job(&jobs[i].0, &jobs[i].1, light));
+        } else {
+            for (shadow, steps) in &jobs {
+                job(shadow, steps, light);
+            }
+        }
+        // The time counted is the time it took, not the threads' sum.
+        let took = started.elapsed();
+        let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
+        PREPARING[0].fetch_sub(summed.saturating_sub(took.as_micros() as u64), Ordering::Relaxed);
+        WRITE_JOB_STATS[5].fetch_add(took.as_micros() as u64, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        {
+            SPLIT[6].fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
+            SPLIT[9].fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
+        }
+    }
+
     /// Brings `[from, to)` of a copy up to date, timed.
     fn update(shadow: &crate::shadow::Shadow, from: usize, to: usize) {
         let started = std::time::Instant::now();
@@ -9333,6 +9509,9 @@ impl Batch {
 
     fn flush(&mut self) {
         self.refresh_textures();
+        // `VICTORY_WRITE_JOBS`: the copies' jobs first (their copies' later
+        // refreshes go with them).
+        self.run_jobs();
         self.index.clear();
         if self.refreshes.is_empty() {
             self.sparse.clear();
