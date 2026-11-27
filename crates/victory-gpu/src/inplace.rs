@@ -205,44 +205,100 @@ fn free_mb() -> u64 {
     m.ullAvailPhys >> 20
 }
 
+/// Milliseconds since [`windows_step`]'s clock began (the first frame line
+/// or pass, whichever came first).
+fn since_start_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+/// When the world began ([`since_start_ms`]; 0: not yet): the first
+/// frame-rate line of more than 2,000 draws a frame.
+static WORLD_SINCE: AtomicU64 = AtomicU64::new(0);
+
+/// The frame-rate line's draws a frame (`crate::host`): the world is up from
+/// the first line over 2,000.
+pub(crate) fn frame_drawn(draws: f64) {
+    if draws > 2000.0 && WORLD_SINCE.load(Ordering::Relaxed) == 0 {
+        WORLD_SINCE.store(since_start_ms().max(1), Ordering::Relaxed);
+    }
+}
+
+/// The windows [`windows_step`] opened and the title has not remapped since.
+static OPENED: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
+
 /// [`windows_inplace`]'s step, at each pass over the heap's buffer views
-/// (`crate::draw`): every two seconds, once the world has been up a while
-/// and free RAM allows, the windows whose refreshes copied the most since
-/// the last step are opened in place, up to four a step and the cap in all.
-/// Returns the windows opened, and those let go since (the title mapped
-/// other pages there): the title slots that view them are to be made again.
+/// (`crate::draw`), every two seconds:
+/// - free RAM under `VICTORY_WINDOWS_INPLACE_CLOSE_MB` (2250; a little over
+///   the ON runs' 2.0 GB guard, so the closing comes before the guard): every
+///   window opened is closed, back to its copy (let go as a remapped window
+///   is; its next copy is made whole), and none opens for a minute;
+/// - otherwise, from `VICTORY_WINDOWS_INPLACE_WORLD_S` (20) seconds after the
+///   world is up (and not before `VICTORY_WINDOWS_INPLACE_AFTER_S`, 0, from
+///   the start), with free RAM at `VICTORY_WINDOWS_INPLACE_FREE_MB` (2300) or
+///   more: the windows whose refreshes copied the most since the last step
+///   (at least `VICTORY_WINDOWS_INPLACE_MIN_KB`, 256) are opened, up to four
+///   a step and `VICTORY_WINDOWS_INPLACE_MOST` (16) in all.
+/// Returns the windows opened or closed, and those let go since (the title
+/// mapped other pages there): the title slots that view them are to be
+/// made again.
 pub(crate) fn windows_step() -> Vec<(u64, u64)> {
     let mut out = std::mem::take(&mut *crate::shadow::WINDOWS_LET_GO.lock().unwrap_or_else(|e| e.into_inner()));
     if !out.is_empty() {
-        let n = out.len() as u64;
-        let _ = WINDOWS_OPEN.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |open| Some(open.saturating_sub(n)));
+        let mut opened = OPENED.lock().unwrap_or_else(|e| e.into_inner());
+        opened.retain(|w| !out.contains(w));
+        WINDOWS_OPEN.store(opened.len() as u64, Ordering::Relaxed);
     }
-    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     static LAST: AtomicU64 = AtomicU64::new(0);
+    static HELD_UNTIL: AtomicU64 = AtomicU64::new(0);
     static REFUSED: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
-    let now = START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64;
-    if now < windows_arg("VICTORY_WINDOWS_INPLACE_AFTER_S", 120) * 1000 || now < LAST.load(Ordering::Relaxed) + 2000 {
+    let now = since_start_ms();
+    if now < LAST.load(Ordering::Relaxed) + 2000 {
         return out;
     }
     LAST.store(now, Ordering::Relaxed);
+    let free = free_mb();
+    // Under the closing line: everything opened goes back to its copy.
+    if free < windows_arg("VICTORY_WINDOWS_INPLACE_CLOSE_MB", 2250) {
+        let opened = std::mem::take(&mut *OPENED.lock().unwrap_or_else(|e| e.into_inner()));
+        if !opened.is_empty() {
+            for &(start, len) in &opened {
+                crate::shadow::in_place_let_go(start, len);
+            }
+            // (`in_place_let_go` noted them for the slots; they come back next step too.)
+            out.extend(opened.iter().copied());
+            WINDOWS_OPEN.store(0, Ordering::Relaxed);
+            HELD_UNTIL.store(now + 60_000, Ordering::Relaxed);
+            tracing::warn!(free_mb = free, windows = opened.len(), "free RAM low: the windows in place are closed, back to their copies, for a minute at least (VICTORY_WINDOWS_INPLACE)");
+        }
+        return out;
+    }
+    let world = WORLD_SINCE.load(Ordering::Relaxed);
+    if world == 0
+        || now < world + windows_arg("VICTORY_WINDOWS_INPLACE_WORLD_S", 20) * 1000
+        || now < windows_arg("VICTORY_WINDOWS_INPLACE_AFTER_S", 0) * 1000
+        || now < HELD_UNTIL.load(Ordering::Relaxed)
+    {
+        return out;
+    }
     let (most, floor, least) = (
         windows_arg("VICTORY_WINDOWS_INPLACE_MOST", 16),
-        windows_arg("VICTORY_WINDOWS_INPLACE_FREE_MB", 3584),
+        windows_arg("VICTORY_WINDOWS_INPLACE_FREE_MB", 2300),
         windows_arg("VICTORY_WINDOWS_INPLACE_MIN_KB", 256) << 10,
     );
     // (Taken each step whatever comes next: the bytes are the last two seconds'.)
     let busiest = crate::shadow::windows_by_recent(1 << 32);
     let open = WINDOWS_OPEN.load(Ordering::Relaxed);
-    if open >= most || free_mb() < floor {
+    if open >= most || free < floor {
         return out;
     }
     let Some(host) = crate::host::host() else {
         return out;
     };
     let mut refused = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
-    let mut opened = 0;
+    let mut opened_now = Vec::new();
     for (start, len, bytes) in busiest {
-        if bytes < least || open + opened >= most || opened >= 4 {
+        if bytes < least || open + opened_now.len() as u64 >= most || opened_now.len() >= 4 {
             break;
         }
         if refused.contains(&(start, len)) {
@@ -251,7 +307,7 @@ pub(crate) fn windows_step() -> Vec<(u64, u64)> {
         match crate::port::open_window(&host.device, start, len) {
             Ok(placed) => {
                 if crate::shadow::window_swap(start, len, placed) {
-                    opened += 1;
+                    opened_now.push((start, len));
                     STATS[0].fetch_add(1, Ordering::Relaxed);
                     STATS[1].fetch_add(len, Ordering::Relaxed);
                     out.push((start, len));
@@ -259,7 +315,8 @@ pub(crate) fn windows_step() -> Vec<(u64, u64)> {
                         start = format_args!("{start:#x}"),
                         len,
                         copied_kb = bytes >> 10,
-                        open = open + opened,
+                        free_mb = free,
+                        open = open + opened_now.len() as u64,
                         "a window of the page pool opened in place (VICTORY_WINDOWS_INPLACE)"
                     );
                 }
@@ -272,7 +329,9 @@ pub(crate) fn windows_step() -> Vec<(u64, u64)> {
             }
         }
     }
-    WINDOWS_OPEN.fetch_add(opened, Ordering::Relaxed);
+    let mut opened = OPENED.lock().unwrap_or_else(|e| e.into_inner());
+    opened.extend(opened_now);
+    WINDOWS_OPEN.store(opened.len() as u64, Ordering::Relaxed);
     out
 }
 
