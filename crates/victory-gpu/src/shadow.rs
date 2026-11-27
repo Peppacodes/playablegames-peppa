@@ -3696,7 +3696,10 @@ impl Shadow {
                 return to;
             }
             let at = from + (to - from) / threads * i;
-            (at - (start + at) % PIECE).max(from)
+            // (Saturating: near the copy's start, the piece `at` lies in may begin
+            // before the copy does; the subtraction wrapped and the first slice
+            // was never compared in a release build.)
+            at.saturating_sub((start + at) % PIECE).max(from)
         };
         let scan = &scan;
         std::thread::scope(|s| {
@@ -6207,4 +6210,41 @@ static STAMP_EPOCH: AtomicU64 = AtomicU64::new(1);
 /// A submission begins, or a step of ours is about to write title memory.
 pub(crate) fn stamps_expire() {
     STAMP_EPOCH.fetch_add(1, Ordering::AcqRel);
+}
+
+#[cfg(test)]
+mod big_compare_tests {
+    use super::*;
+
+    /// The compare after a submission (`Shadow::differing`) cuts a range of
+    /// 32 MiB or more into slices on several threads, each cut on a piece of
+    /// title memory. A copy that starts 32 KiB into a piece, compared from
+    /// its first byte: the first cut lay below the copy's start, so the
+    /// subtraction wrapped (and panicked with overflow checks), and in a
+    /// release build the first slice was never compared. Every changed byte
+    /// is found now, in the first slice too, and no unchanged piece.
+    /// (fxceless/victory-fork pull request 1407, PiloteCode.)
+    #[test]
+    fn a_big_compare_finds_changes_in_its_first_slice() {
+        const LEN: usize = 48 << 20;
+        let before = vec![0u8; LEN];
+        let mut copy = before.clone();
+        let changed = [0usize, 100, (64 << 10) - 1, (64 << 10) + 5, 3 << 20, 20 << 20, 40 << 20, LEN - 1];
+        for &at in &changed {
+            copy[at] = 1;
+        }
+        // A title address 32 KiB into a 64 KiB piece (never read: the
+        // compare reads the copy's own bytes).
+        let start = 0x0012_3456_8000u64;
+        let shadow = Shadow::unbacked(start, copy.as_mut_ptr(), LEN as u64, false);
+        let found = shadow.differing(0, LEN, &before);
+        for &at in &changed {
+            assert!(found.iter().any(|&(a, n)| (a..a + n).contains(&at)), "the change at {at:#x} was not found: {found:x?}");
+        }
+        for &(a, n) in &found {
+            assert!(changed.iter().any(|&at| (a..a + n).contains(&at)), "an unchanged piece at {a:#x}+{n:#x}");
+            // Cut on pieces of title memory: each ends on a piece or at the range's end.
+            assert!((start as usize + a + n).is_multiple_of(PIECE) || a + n == LEN, "{a:#x}+{n:#x}");
+        }
+    }
 }
