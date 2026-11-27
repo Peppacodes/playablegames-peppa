@@ -69,7 +69,10 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {
         let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
         if builder {
-            return false;
+            // With the builder they come back, unless `VICTORY_RT_RESOLVE=0`
+            // keeps them out (as `VICTORY_ACTIVATE_RAYS=0` does for its
+            // programs): upstream refused these after losing the card.
+            return std::env::var_os("VICTORY_RT_RESOLVE").is_some_and(|v| v == "0");
         }
         // Without BVH, ~1,000 CS_RaytracingResolve shaders shade no hits while
         // clogging the cold compiler queue; skip unless VICTORY_RT_RESOLVE=1.

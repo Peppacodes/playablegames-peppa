@@ -154,7 +154,18 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
 /// (By those times everything idle for 2.5 s went from 75 % of the budget
 /// on: 61,000 of them in the first 300 s of session play-1125-0203, at 78 to
 /// 80 %, of which 13,000 were made and uploaded again.)
+///
+/// `VICTORY_TEXTURE_KEEP_PERCENT=<p>` (40 to 88; unset: 88) moves the three
+/// lines down together: kept under `p`, the 5 s rule from there to `p + 7`,
+/// down to `p - 3` (unset: 88, 95, 85, as before). Every MB the card holds
+/// past its own memory is also a MB of the PC's commit (Belobug's tree,
+/// pull request 394: at 75 on an RTX 3090 with 32 GB, private memory 31.9
+/// -> 29.3 GB).
 pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
+    keep_at(budget, used, keep_percent())
+}
+
+fn keep_at(budget: u64, used: u64, keep: u64) -> (u64, u64) {
     const KEPT_MS: u64 = 600_000;
     const IDLE_MS: u64 = 5_000;
     const SHORT_MS: u64 = 1_500;
@@ -162,13 +173,30 @@ pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
         return (IDLE_MS, u64::MAX);
     }
     let share = |percent: u64| budget / 100 * percent;
-    if used < share(88) {
+    if used < share(keep) {
         (KEPT_MS, u64::MAX)
-    } else if used < share(95) {
-        (IDLE_MS, used - share(85))
+    } else if used < share(keep + 7) {
+        (IDLE_MS, used - share(keep - 3))
     } else {
-        (SHORT_MS, used - share(85))
+        (SHORT_MS, used - share(keep - 3))
     }
+}
+
+/// The texture cache's "keep for minutes" line in percent of the card's
+/// budget ([`vram_keep`]).
+fn keep_percent() -> u64 {
+    static P: OnceLock<u64> = OnceLock::new();
+    *P.get_or_init(|| {
+        let p = keep_line(std::env::var("VICTORY_TEXTURE_KEEP_PERCENT").ok().as_deref());
+        if p != 88 {
+            tracing::info!(percent = p, "textures kept for minutes under that share of the card (VICTORY_TEXTURE_KEEP_PERCENT)");
+        }
+        p
+    })
+}
+
+fn keep_line(setting: Option<&str>) -> u64 {
+    setting.and_then(|v| v.trim().parse::<u64>().ok()).map_or(88, |p| p.clamp(40, 88))
 }
 
 /// Effective idle timeout (in milliseconds) for VRAM-backed host textures,
@@ -9803,8 +9831,16 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
         if info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
-            // SAFETY: this path is only used with a writable host destination.
-            unsafe { to.write_bytes(0, n) };
+            if crate::texture::committed(to, n) {
+                // SAFETY: a committed host destination of `n` bytes.
+                unsafe { to.write_bytes(0, n) };
+            } else {
+                // A destination only partly committed (run RTTR: 9 MB written
+                // into a copy committed for its first 0.5 MB, write fault on
+                // reserved memory): zeros page by page through the safe copy,
+                // which leaves out what is not there.
+                for_pieces(to as usize, n, 4 << 10, |at, k| zero(at as *mut u8, k));
+            }
         } else if !read(at, to, n) {
             // A mapping may change between query and read.
             read_pieces(at, to, n);
@@ -12207,6 +12243,18 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!((ms, bytes), (5_000, 5 * gib));
         assert_eq!(vram_keep(100 * gib, 120 * gib), (1_500, 35 * gib));
         assert_eq!(vram_keep(0, 7).0, 5_000);
+        // VICTORY_TEXTURE_KEEP_PERCENT: unset is the lines above; 75 moves
+        // them to 75, 82 and 72.
+        use super::{keep_at, keep_line};
+        assert_eq!(keep_line(None), 88);
+        assert_eq!(keep_line(Some(" 75 ")), 75);
+        assert_eq!(keep_line(Some("20")), 40);
+        assert_eq!(keep_line(Some("99")), 88);
+        assert_eq!(keep_line(Some("lots")), 88);
+        assert_eq!(keep_at(100 * gib, 90 * gib, 88), (5_000, 5 * gib));
+        assert_eq!(keep_at(100 * gib, 74 * gib, 75).0, 600_000);
+        assert_eq!(keep_at(100 * gib, 80 * gib, 75), (5_000, 8 * gib));
+        assert_eq!(keep_at(100 * gib, 90 * gib, 75), (1_500, 18 * gib));
     }
 
     #[test]
