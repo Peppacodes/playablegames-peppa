@@ -550,6 +550,15 @@ fn window_mapped_most() -> u64 {
 /// Bytes alive of windows in card memory the CPU maps.
 static WINDOW_MAPPED_BYTES: AtomicU64 = AtomicU64::new(0);
 
+/// Windows that did not go into card memory the CPU maps: over the 80% budget line,
+/// over `VICTORY_WINDOWS_BAR_MB`, the host refused (diagnostics line).
+pub(crate) static WINDOW_MAPPED_REFUSED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// [`WINDOW_MAPPED_BYTES`], for the memory line.
+pub(crate) fn window_mapped_bytes() -> u64 {
+    WINDOW_MAPPED_BYTES.load(Ordering::Relaxed)
+}
+
 /// A buffer for a window of `size` bytes in card memory the CPU maps, if it is
 /// to be there ([`window_mapped_most`]).
 fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
@@ -561,15 +570,18 @@ fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
     if let Some([budget, used, ..]) = host.video_memory()
         && used + size > budget / 10 * 8
     {
+        WINDOW_MAPPED_REFUSED[0].fetch_add(1, Ordering::Relaxed);
         return None;
     }
     if WINDOW_MAPPED_BYTES.fetch_add(size, Ordering::Relaxed) + size > most {
         WINDOW_MAPPED_BYTES.fetch_sub(size, Ordering::Relaxed);
+        WINDOW_MAPPED_REFUSED[1].fetch_add(1, Ordering::Relaxed);
         return None;
     }
     let made = host.mapped_card_buffer(size, true);
     if made.is_none() {
         WINDOW_MAPPED_BYTES.fetch_sub(size, Ordering::Relaxed);
+        WINDOW_MAPPED_REFUSED[2].fetch_add(1, Ordering::Relaxed);
     }
     made
 }
