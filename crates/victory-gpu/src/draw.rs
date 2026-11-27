@@ -1903,7 +1903,7 @@ impl State {
             if writes {
                 #[cfg(feature = "diagnostics")]
                 crate::host::wide_write(a, len, self.pipeline);
-                s.gpu_writes(list, a, len);
+                s.gpu_writes_viewed(list, a, len);
             }
         };
         if !crate::pipeline::host::bounded_root_srvs() {
@@ -4693,7 +4693,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             if STORES.get() || !write_skip() {
                 #[cfg(feature = "diagnostics")]
                 crate::host::wide_write(address, len, 0);
-                shadow.gpu_writes(list, address, len);
+                shadow.gpu_writes_viewed(list, address, len);
             } else {
                 #[cfg(feature = "diagnostics")]
                 {
