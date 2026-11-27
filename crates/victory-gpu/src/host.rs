@@ -4150,6 +4150,7 @@ fn late_line(frames: f64) {
     crate::port::log(frames);
     crate::watch::port_guard_line(frames);
     crate::watch::reservation_line(frames);
+    crate::watch::guard_bits_line(frames);
     crate::picked::log(frames);
     #[cfg(feature = "diagnostics")]
     log_blame(frames);
