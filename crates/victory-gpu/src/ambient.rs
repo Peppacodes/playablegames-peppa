@@ -33,6 +33,11 @@
 //! The air of a room is lit by the same probes: without rays they hold the
 //! sky's light indoors too, a brown veil at sunset. `VICTORY_AMBIENT_AIR`
 //! bounds what the air scatters by a multiple of the light around.
+//!
+//! Reflection rays find nothing either, and the program that answers a miss
+//! gives each the sky probe's light: glossy floors, wet skin and eyes show the
+//! open sky at full strength indoors. `VICTORY_AMBIENT_REFLECT` bounds what a
+//! missed ray brings by a multiple of the light around its pixel.
 
 use std::sync::{Mutex, OnceLock};
 
@@ -51,6 +56,11 @@ pub(crate) enum Role {
     /// Adds the lamps' light to what the air scatters (the last program
     /// that writes that volume before it is summed up along the view).
     Air,
+    /// Gives reflection rays that found nothing the sky probe's light
+    /// (`sr_tracing:CS_RayMiss`). Without rays that is every reflection: the
+    /// open sky at full strength in eyes and on wet or glossy surfaces even
+    /// indoors and in shade.
+    Reflect,
 }
 
 /// The program's part in this, by its name in the container.
@@ -62,6 +72,8 @@ pub(crate) fn role(container: &[u8]) -> Option<Role> {
         Some(Role::Radiance)
     } else if has(b"CS_AccumulateLocalLightInscatteringVolume") {
         Some(Role::Air)
+    } else if has(b"CS_RayMiss_de6b91a6") {
+        Some(Role::Reflect)
     } else {
         None
     }
@@ -75,6 +87,9 @@ pub(crate) const DEPTH: (u8, u32) = (0, 464);
 pub(crate) const RADIANCE: (u8, u32) = (1, 16);
 /// Where the light the air scatters is.
 pub(crate) const AIR: (u8, u32) = (1, 32);
+/// Where the ray-miss program writes the light of missed reflection rays
+/// (float RGB; its only image store).
+pub(crate) const REFLECT: (u8, u32) = (1, 104);
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Set {
@@ -110,6 +125,20 @@ fn air() -> f32 {
         let set = std::env::var("VICTORY_AMBIENT_AIR").unwrap_or_default();
         set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0)
     })
+}
+
+/// The most a missed reflection ray brings, as a multiple of the light
+/// around its pixel (`VICTORY_AMBIENT_REFLECT=<multiple>`; unset or 0: the
+/// sky probe's light as the title has it). From avatarmanz/VIctory-7900XTX
+/// pull request 414 (Jrjy3); NitricAcidDev's public tree (9b785cb5) holds
+/// the title's last reflection image to a part of the light instead.
+fn reflect() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| reflect_of(&std::env::var("VICTORY_AMBIENT_REFLECT").unwrap_or_default()))
+}
+
+fn reflect_of(set: &str) -> f32 {
+    set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0)
 }
 
 /// LOCAL: how many times the estimate the title's own result may keep
@@ -372,6 +401,35 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
 }
 #endif
 
+#ifdef REFLECT
+RWTexture2D<float4> mirror : register(u0);
+// What a missed reflection ray brought (the sky probe) is no more than a
+// multiple of the light around its pixel (`most` holds that multiple for
+// this pass): the points' means, taken between the four around by place
+// only (no depth here), mixed with the room's mean as the raise does.
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void cap_reflect(uint3 at : SV_DispatchThreadID) {
+    if (at.x >= width || at.y >= height) return;
+    float2 g = (float2(at.xy) + 0.5) / float2(width, height) * float2(PX, PY) - 0.5;
+    int2 g0 = int2(floor(g));
+    float2 f = g - float2(g0);
+    float3 all = 0;
+    for (int k = 0; k < 4; k++) {
+        int2 q = clamp(g0 + int2(k & 1, k >> 1), int2(0, 0), int2(PX, PY) - 1);
+        float2 b = float2(k & 1 ? f.x : 1 - f.x, k >> 1 ? f.y : 1 - f.y);
+        uint at0 = (q.y * PX + q.x) * 3;
+        all += b.x * b.y * float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
+    }
+    all = lerp(all, cells[CELLS].rgb, 0.2) * level;
+    float cap = max(dot(all, LUMA) * most, 1e-6);
+    float4 c = mirror[at.xy];
+    bool bad = any(isnan(c.rgb));
+    float has = dot(max(c.rgb, 0.0), LUMA);
+    if (has > cap || bad) mirror[at.xy] = float4(bad ? 0.0 : c.rgb * (cap / has), c.a);
+}
+#endif
+
 #ifdef RAISE
 RWTexture2D<uint> light : register(u0);
 float3 unpack(uint v) {
@@ -486,6 +544,7 @@ struct Pass {
     gather: ID3D12PipelineState,
     raise: ID3D12PipelineState,
     air: ID3D12PipelineState,
+    reflect: ID3D12PipelineState,
     cells: ID3D12Resource,
     points: ID3D12Resource,
 }
@@ -517,6 +576,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let gather = pipeline("GATHER", s!("gather"))?;
     let raise = pipeline("RAISE", s!("raise"))?;
     let air = pipeline("AIR", s!("clear_air"))?;
+    let reflect = pipeline("REFLECT", s!("cap_reflect"))?;
     let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
     Ok(Pass {
         root: root.ok_or_else(windows::core::Error::empty)?,
@@ -526,6 +586,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
         gather,
         raise,
         air,
+        reflect,
         cells: made(CELL_BYTES)?,
         points: made(POINT_BYTES)?,
     })
@@ -582,6 +643,9 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     if role == Role::Air && (constant > 0.0 || air() == 0.0) {
         return false;
     }
+    if role == Role::Reflect && (constant > 0.0 || reflect() == 0.0) {
+        return false;
+    }
     static SAID: Mutex<u32> = Mutex::new(0);
     {
         let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
@@ -595,6 +659,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                 floor = floor(),
                 chroma = chroma(),
                 magenta = magenta(),
+                reflect = reflect(),
                 "a stand-in for the indirect light"
             );
         }
@@ -620,7 +685,8 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
         _ => (0.04f32, 0.0f32),
     };
     words[8] = follow.to_bits();
-    words[9] = most().to_bits();
+    // (The reflection cap reads its multiple where the raise reads `most`.)
+    words[9] = if role == Role::Reflect { reflect() } else { most() }.to_bits();
     words[10] = air().to_bits();
     words[12] = settle().map_or(0.0f32, |s| s.jump).to_bits();
     words[13] = settle().map_or(0.0f32, |s| s.fresh).to_bits();
@@ -651,6 +717,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                 KEPT.store(true, Ordering::Relaxed);
             }
             Role::Air => run(&pass.air, views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2)),
+            Role::Reflect => run(&pass.reflect, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1),
             Role::Resolve => {
                 if constant == 0.0 {
                     run(&pass.place, 8, 9, 1);
@@ -679,6 +746,9 @@ mod tests {
         assert_eq!(floor_of("0.05"), 0.05);
         assert_eq!(floor_of("-1"), 0.0);
         assert_eq!(floor_of("nan"), 0.0);
+        assert_eq!(reflect_of(""), 0.0);
+        assert_eq!(reflect_of("1"), 1.0);
+        assert_eq!(reflect_of("-2"), 0.0);
     }
 
     #[test]
@@ -686,6 +756,8 @@ mod tests {
         assert_eq!(role(b"..CS_ScreenProbes_TemporalResolve_a911b49c_Wrapped.."), Some(Role::Resolve));
         assert_eq!(role(b"..CS_CacheScreenSpaceRadiance_eed2fc35.."), Some(Role::Radiance));
         assert_eq!(role(b"CS_AccumulateLocalLightInscatteringVolume_7e2f5eef"), Some(Role::Air));
+        assert_eq!(role(b"sr_tracing:CS_RayMiss_de6b91a6_Wrapped"), Some(Role::Reflect));
+        assert_eq!(role(b"CS_RayMiss_Volumetrics_3c5d8c00"), None);
         assert_eq!(role(b"CS_TemporalResolve"), None);
     }
 
