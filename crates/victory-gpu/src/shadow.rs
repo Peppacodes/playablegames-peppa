@@ -62,6 +62,9 @@ pub(crate) struct Shadow {
     /// none, and every refresh and "known to copy nothing" look took the
     /// lock to find that out.
     has_pending: std::sync::atomic::AtomicBool,
+    /// With [`refresh_stamp`]: the last range refreshed whole and the
+    /// [`STAMP_EPOCH`] it was refreshed in (0: none).
+    stamp: Mutex<(u64, usize, usize)>,
     /// With [`relay`]: how many submissions not yet copied back declared
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
@@ -3301,6 +3304,7 @@ impl Shadow {
             pending: Mutex::default(),
             flights: Mutex::default(),
             has_pending: Default::default(),
+            stamp: Mutex::default(),
             before: Mutex::default(),
             merging: RwLock::default(),
             kept: Mutex::default(),
@@ -3827,6 +3831,7 @@ impl Shadow {
     /// cannot say what was written, a snapshot is missing, or `runs_left`
     /// ran out. Pages done before that stay done.
     pub(crate) fn merge_under_writes(&self, address: usize, len: usize, runs_left: &mut usize) -> bool {
+        self.unstamp();
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -4090,6 +4095,16 @@ impl Shadow {
         if from >= to {
             return 0;
         }
+        // A range this submission refreshed whole already, with no step of
+        // ours writing title memory since: nothing to ask.
+        let stamped = refresh_stamp();
+        let epoch = STAMP_EPOCH.load(Ordering::Acquire);
+        if stamped {
+            let (at, a, e) = *self.stamp.lock().unwrap_or_else(|e| e.into_inner());
+            if at == epoch && a <= from && to <= e {
+                return 0;
+            }
+        }
         // (No lock when there is nothing pending, as for most copies.)
         let mut busy: Vec<(usize, usize)> = if !self.has_pending.load(Ordering::Acquire) {
             Vec::new()
@@ -4119,7 +4134,17 @@ impl Shadow {
             }
             return bytes;
         }
-        self.update_free(from, to)
+        let copied = self.update_free(from, to);
+        if stamped {
+            *self.stamp.lock().unwrap_or_else(|e| e.into_inner()) = (epoch, from, to);
+        }
+        copied
+    }
+
+    /// What the copy holds changed other than by a refresh: its stamp
+    /// ([`refresh_stamp`]) is no longer true.
+    fn unstamp(&self) {
+        *self.stamp.lock().unwrap_or_else(|e| e.into_inner()) = (0, 0, 0);
     }
 
     /// Whether [`Shadow::update`] of `[address, address + len)` would copy
@@ -4662,6 +4687,7 @@ impl Shadow {
     /// is then what differs from them when the submission has run. The range
     /// is declared written by it, and its sends are taken.
     pub(crate) fn placed_copy(&self, address: usize, bytes: &[u8]) {
+        self.unstamp();
         let (from, to) = self.inside(address, bytes.len());
         if from >= to || self.place.is_some() {
             return;
@@ -5066,6 +5092,7 @@ impl Shadow {
     /// later has a number above it: a write of the title's takes the block's
     /// bit, until an asking has noted it.
     pub(crate) fn landed(&self, block: usize, before: u64, now: u64) -> bool {
+        self.unstamp();
         let Some(page) = block.checked_sub(self.start as usize / PAGE) else {
             return false;
         };
@@ -6116,4 +6143,30 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+/// Whether a refresh of a copy's range that the same submission already
+/// refreshed whole, with no step of ours writing title memory since,
+/// returns at once (`VICTORY_REFRESH_STAMP=1`, or its phase of
+/// `VICTORY_AB`; off: every request asks, as before). Run L7E1's work
+/// census: 216 of ~1,180 refreshes a frame asked again for a copy and range
+/// of the same submission, 142 of them card copies on the submitting
+/// thread. The title's CPU writes during the preparation are for later
+/// submissions; the first refresh's bytes are what this one reads.
+pub(crate) fn refresh_stamp() -> bool {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if let Some(on) = crate::ab::pick("VICTORY_REFRESH_STAMP") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_REFRESH_STAMP"))
+}
+
+/// Moves at each submission's start and before each step of ours that
+/// writes title memory: a copy's stamp of another number is no stamp.
+static STAMP_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+/// A submission begins, or a step of ours is about to write title memory.
+pub(crate) fn stamps_expire() {
+    STAMP_EPOCH.fetch_add(1, Ordering::AcqRel);
 }
