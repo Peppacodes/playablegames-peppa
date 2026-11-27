@@ -418,6 +418,8 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
             {
                 #[cfg(feature = "diagnostics")]
                 sites::patched();
+                #[cfg(feature = "diagnostics")]
+                tracing::info!(at = format_args!("{:#x}", rip as usize), what = ?what, "a console wait instruction replaced: the title spins there now (VICTORY_PATCH_WAITS)");
             }
             std::hint::spin_loop();
         }

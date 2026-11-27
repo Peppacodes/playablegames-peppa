@@ -4069,6 +4069,18 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        #[cfg(all(windows, feature = "diagnostics"))]
+        if crate::workcensus::counting() {
+            let started = std::time::Instant::now();
+            let copied = self.update_uncounted(address, len);
+            crate::workcensus::refreshed(self.id as usize, address, len, self.card.is_some(), copied, started.elapsed().as_nanos() as u64);
+            return copied;
+        }
+        self.update_uncounted(address, len)
+    }
+
+    /// [`Shadow::update`] itself.
+    fn update_uncounted(&self, address: usize, len: usize) -> usize {
         // In place: the card reads title memory itself.
         if self.place.is_some() {
             return 0;
@@ -4136,6 +4148,10 @@ impl Shadow {
             use crate::copystat::{C, add};
             add(C::Checked, (to - from) as u64);
             add(C::Unchanged, (to - from) as u64);
+        }
+        #[cfg(feature = "diagnostics")]
+        if same {
+            crate::workcensus::known_nothing(from, self.card.is_some());
         }
         same
     }
