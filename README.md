@@ -7,6 +7,9 @@ user's own copy: from a save into the open world, in-game and playable with a
 controller, at 23.5 fps held over a 12 minute run standing in a house interior
 (three shorter runs of the same build: 22.8 to 23.9 fps).
 
+**Video:** a recorded stream of this build on the RTX 5080, playing in the world
+at 20 to 25 fps: https://rumble.com/v7izo20 (the owner's own channel).
+
 | Milestone | Status |
 |---|---|
 | The game starts, first frame, main menu | Works |
