@@ -3555,6 +3555,11 @@ fn joins_asked() -> (usize, usize) {
     if crate::ab::pick("VICTORY_JOIN_MORE") == Some(true) {
         return (parts.max(8) * 4, lists * 4);
     }
+    // `VICTORY_JOIN_DOUBLE`: twice the parts (of at least 8) and the lists.
+    #[cfg(feature = "diagnostics")]
+    if crate::ab::pick("VICTORY_JOIN_DOUBLE") == Some(true) {
+        return (parts.max(8) * 2, lists * 2);
+    }
     #[cfg(feature = "diagnostics")]
     if let Some(on) = crate::ab::pick("VICTORY_JOIN_PARTS") {
         return (if on { 8 } else { 1 }, lists);
@@ -3566,9 +3571,16 @@ fn joins_asked() -> (usize, usize) {
 /// before it and has not been sent: nothing done on the CPU for it reads what
 /// those give their shaders, write back or write when they are done, and it
 /// changes no title memory that they read ([`Step::Copy`], [`Step::Run`]).
-pub(crate) fn joinable<'a>(ahead: impl Iterator<Item = &'a HostList>, next: &[&HostList]) -> bool {
+///
+/// `None` if it can; else why not, for the line's frame line: [`UNJOINABLE_STEP`] a title buffer copy or work
+/// of ours in it; else the first of its reads that meets what `ahead`
+/// gives its shaders, writes back or writes when done:
+/// [`UNJOINABLE_FILL`] a fill of upload memory, [`UNJOINABLE_TEXTURE`] a
+/// texture or a movie plane, [`UNJOINABLE_PLACED`] a copy at its place (or
+/// what it writes). `None`: joinable.
+pub(crate) fn unjoinable<'a>(ahead: impl Iterator<Item = &'a HostList>, next: &[&HostList]) -> Option<usize> {
     if next.iter().any(|l| l.deferred().copies.iter().any(|s| matches!(s, Step::Copy(..) | Step::Run(_)))) {
-        return false;
+        return Some(UNJOINABLE_STEP);
     }
     let ahead: Vec<&HostList> = ahead.collect();
     let mut written: Vec<(usize, usize)> = declared_writes(&ahead).into_iter().flat_map(|(_, ranges)| ranges).collect();
@@ -3579,8 +3591,32 @@ pub(crate) fn joinable<'a>(ahead: impl Iterator<Item = &'a HostList>, next: &[&H
     }
     let mut joined = Vec::new();
     join_ranges(&mut joined, written);
-    blocked_by(&joined, next, false).is_none()
+    blocked_by(&joined, next, false)?;
+    // Which read it is (`blocked_by` said one is): the first that meets it.
+    for list in next {
+        for step in &list.deferred().copies {
+            match step {
+                &Step::Fill(_, src, len, _) if read_blocked(&joined, src, len) => return Some(UNJOINABLE_FILL),
+                Step::Texture(staging) => {
+                    let (at, len) = staging.memory();
+                    if touches(&joined, at, at + len) {
+                        return Some(UNJOINABLE_TEXTURE);
+                    }
+                }
+                &Step::Plane((at, len), _) if touches(&joined, at, at.saturating_add(len)) => return Some(UNJOINABLE_TEXTURE),
+                _ => {}
+            }
+        }
+    }
+    Some(UNJOINABLE_PLACED)
 }
+
+/// Causes of [`unjoinable`] (after the line's own two: the parts and the
+/// lists a host submission may hold).
+pub(crate) const UNJOINABLE_STEP: usize = 2;
+pub(crate) const UNJOINABLE_FILL: usize = 3;
+pub(crate) const UNJOINABLE_TEXTURE: usize = 4;
+pub(crate) const UNJOINABLE_PLACED: usize = 5;
 
 /// Whether a bottom-of-pipe write of `list` meets `wait`.
 pub(crate) fn will_meet(list: &HostList, wait: &crate::list::ValueWait) -> bool {
