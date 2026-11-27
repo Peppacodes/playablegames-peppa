@@ -893,6 +893,12 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     let mut kept = host.buffer_sweep.lock().unwrap_or_else(|e| e.into_inner());
     let BufferSweep { passes, ranges, unwatched } = &mut *kept;
     let changed = host.buffer_changes();
+    // `VICTORY_WINDOWS_INPLACE`: windows opened in place or let go since the
+    // last pass. The title slots that view them are made again (looked at
+    // in this pass; a draw's table's, when the draw reads it): until then
+    // they show the copy they showed, which this pass keeps refreshing.
+    let swapped = if crate::inplace::windows_inplace() { crate::inplace::windows_step() } else { Vec::new() };
+    let remade = if swapped.is_empty() { Vec::new() } else { slots_over(heap, host, &swapped) };
     let all = *passes == 0 || (*passes % HEAP_ROUND == 0 && !heap_spread());
     let slots = if all {
         ranges.0.clear();
@@ -907,6 +913,8 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     } else {
         changed
     };
+    let mut slots = slots;
+    slots.extend(remade);
     *passes += 1;
     // Whether the device was there before the pass: a view that removes
     // it is named below.
@@ -5037,4 +5045,25 @@ mod record_hash_tests {
         let zeros: Vec<u64> = (2..100).map(|n| of(&vec![[0; 3]; n])).collect();
         assert!(zeros.iter().all(|h| seen.insert(*h)));
     }
+}
+
+/// `VICTORY_WINDOWS_INPLACE`: the title slots of `heap` that hold a buffer
+/// view of memory in `windows` (each start and bytes), made again at their
+/// next look ([`crate::descriptor::host::HostHeap::remake`]).
+fn slots_over(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::HostHeap, windows: &[(u64, u64)]) -> Vec<u32> {
+    let mut remade = Vec::new();
+    for index in host.buffer_slots() {
+        let Some(view) = heap.handle(index).and_then(crate::descriptor::view) else {
+            continue;
+        };
+        let Some((address, len)) = crate::descriptor::host::buffer_range(&view) else {
+            continue;
+        };
+        if windows.iter().any(|&(start, bytes)| address < start + bytes && start < address + len.max(1)) {
+            host.remake(index);
+            remade.push(index);
+        }
+    }
+    tracing::debug!(windows = windows.len(), slots = remade.len(), "slots made again over windows in place or let go");
+    remade
 }

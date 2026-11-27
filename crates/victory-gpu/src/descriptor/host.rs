@@ -3821,6 +3821,18 @@ impl HostHeap {
         Some(view)
     }
 
+    /// Slot `index` is made again at its next [`HostHeap::mirror`] whatever its
+    /// record: the memory its view shows was opened in place, or let go
+    /// (`crate::inplace::windows_step`). Until then it shows what it showed.
+    pub(crate) fn remake(&self, index: u32) {
+        if index >= self.count {
+            return;
+        }
+        let _held = self.made.lock(index);
+        self.quick_is(index, 0);
+        self.made.set(index, 0);
+    }
+
     /// Whether slot `index` was made from no record: what [`HostHeap::mirror`]
     /// would find before it did nothing for one that holds no view.
     pub(crate) fn shows_none(&self, index: u32) -> bool {

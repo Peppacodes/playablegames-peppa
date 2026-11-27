@@ -399,3 +399,55 @@ mod tests {
         }
     }
 }
+
+/// `VICTORY_WINDOWS_INPLACE` (`crate::inplace::windows_step`): title memory
+/// `[start, start + len)`, one run of one section of the title's page pool,
+/// opened as a host heap through a view of ours of exactly its 64 KiB
+/// pages (as [`open_region`] opens a stretch of the 32-bit heap) and one
+/// buffer placed over it. The pool's section stays reserved as `xmem` makes
+/// it: the pages the title shows there are committed already, and opening
+/// locks only these. shortcut: the view stays mapped for good, as a
+/// region's does.
+pub(crate) fn open_window(device: &ID3D12Device, start: u64, len: u64) -> Result<Placed, String> {
+    let crate::inplace::Cover::Run(section, offset) = cover(start as usize, len as usize) else {
+        return Err("not one run of a section".into());
+    };
+    let at = start & !(K64 - 1);
+    let bytes = (start + len.max(1)).next_multiple_of(K64) - at;
+    let Some(from) = offset.checked_sub(start - at) else {
+        return Err("the run starts inside the window's first page".into());
+    };
+    if from % K64 != 0 {
+        return Err("the section's pages are not aligned with the window's".into());
+    }
+    // SAFETY: the section of a view the title has; the runtime keeps its
+    // handle open while a view of it is there, and the range is inside it.
+    let view = unsafe { mem::MapViewOfFile(section as _, mem::FILE_MAP_WRITE, (from >> 32) as u32, from as u32, bytes as usize) }.Value as usize;
+    if view == 0 {
+        return Err(format!("no view of the window's pages: {}", std::io::Error::last_os_error()));
+    }
+    let unmap = || {
+        // SAFETY: our own view, nothing opened on it.
+        unsafe { mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
+    };
+    if !committed(view, bytes as usize) {
+        unmap();
+        return Err("pages of the window are not committed".into());
+    }
+    let heap = match crate::inplace::open(device, crate::inplace::From::Part(view, bytes as usize)) {
+        Ok(heap) => heap,
+        Err(e) => {
+            unmap();
+            return Err(format!("refused by the host: {e}"));
+        }
+    };
+    match crate::inplace::place(device, &heap, 0, bytes) {
+        Ok(buffer) => {
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
+            Ok(Placed { buffer, heap, gpu, bias: start - at })
+        }
+        // (The heap holds our view's pages while it stands; dropped here.)
+        Err(e) => Err(format!("no buffer placed in it: {e}")),
+    }
+}

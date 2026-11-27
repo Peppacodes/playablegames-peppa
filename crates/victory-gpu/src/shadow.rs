@@ -65,6 +65,9 @@ pub(crate) struct Shadow {
     /// With [`refresh_stamp`]: the last range refreshed whole and the
     /// [`STAMP_EPOCH`] it was refreshed in (0: none).
     stamp: Mutex<(u64, usize, usize)>,
+    /// Bytes refreshed since `crate::inplace` last looked (`VICTORY_WINDOWS_INPLACE`
+    /// picks the windows that copy the most).
+    recent: AtomicU64,
     /// With [`relay`]: how many submissions not yet copied back declared
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
@@ -3308,6 +3311,7 @@ impl Shadow {
             flights: Mutex::default(),
             has_pending: Default::default(),
             stamp: Mutex::default(),
+            recent: AtomicU64::new(0),
             before: Mutex::default(),
             merging: RwLock::default(),
             kept: Mutex::default(),
@@ -4118,9 +4122,16 @@ impl Shadow {
             let copied = self.update_uncounted(address, len);
             crate::workcensus::refreshed(self.id as usize, address, len, self.card.is_some(), copied, started.elapsed().as_nanos() as u64);
             crate::workcensus::copy_refreshed(self.id, self.start, self.len, self.window, self.card.is_some(), copied, started.elapsed().as_nanos() as u64);
+            if self.window {
+                self.recent.fetch_add(copied as u64, Ordering::Relaxed);
+            }
             return copied;
         }
-        self.update_uncounted(address, len)
+        let copied = self.update_uncounted(address, len);
+        if self.window {
+            self.recent.fetch_add(copied as u64, Ordering::Relaxed);
+        }
+        copied
     }
 
     /// [`Shadow::update`] itself.
@@ -5448,6 +5459,10 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
             .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
             .map(|(key, _)| *key)
             .collect();
+        // The slots that show them are made again (`crate::inplace`).
+        if !keys.is_empty() && crate::inplace::windows_inplace() {
+            WINDOWS_LET_GO.lock().unwrap_or_else(|e| e.into_inner()).extend(keys.iter().copied());
+        }
         gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
     }
     {
@@ -6209,3 +6224,39 @@ static STAMP_EPOCH: AtomicU64 = AtomicU64::new(1);
 pub(crate) fn stamps_expire() {
     STAMP_EPOCH.fetch_add(1, Ordering::AcqRel);
 }
+
+/// `VICTORY_WINDOWS_INPLACE` (`crate::inplace::windows_step`): the windows
+/// that are copies, at or above `min_start`, with the bytes their
+/// refreshes copied since the last call (taken), the most first.
+pub(crate) fn windows_by_recent(min_start: u64) -> Vec<(u64, u64, u64)> {
+    let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+    let mut all: Vec<(u64, u64, u64)> = map
+        .iter()
+        .filter(|(key, shadow)| key.0 >= min_start && shadow.window && shadow.place.is_none() && shadow.card.is_none())
+        .map(|(key, shadow)| (key.0, key.1, shadow.recent.swap(0, Ordering::Relaxed)))
+        .collect();
+    all.sort_unstable_by(|a, b| b.2.cmp(&a.2));
+    all
+}
+
+/// The window `(start, len)`, a copy, is the title's own memory from now on
+/// (`VICTORY_WINDOWS_INPLACE`): the next lookup finds `placed`. The copy
+/// stays alive while slots and lists hold it (and is refreshed by what
+/// still names it); `true` if the window was there to swap.
+pub(crate) fn window_swap(start: u64, len: u64, placed: crate::inplace::Placed) -> bool {
+    let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+    let Some(old) = map.get(&(start, len)) else {
+        return false;
+    };
+    if !old.window || old.place.is_some() {
+        return false;
+    }
+    let shadow = Arc::new(Shadow::placed(placed, start, len, true));
+    shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+    map.insert((start, len), shadow);
+    true
+}
+
+/// Windows in place let go since the last call (their memory changed):
+/// the slots that show them are to be made again (`crate::inplace`).
+pub(crate) static WINDOWS_LET_GO: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());

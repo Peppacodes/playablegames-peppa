@@ -167,6 +167,115 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     }
 }
 
+/// `VICTORY_WINDOWS_INPLACE=1` (off by default): windows of the title's
+/// page pool (above 4 GiB, copies in the PC's memory that the card reads
+/// over the bus) whose refreshes copy the most are opened in place while
+/// the title runs ([`windows_step`]): through a view of ours of their pages,
+/// by address (`crate::port::open_window`), the pool's section left as the
+/// runtime makes it. Shaders then read the title's own pages; the window's
+/// copy, its refreshes and its askings go. Arguments:
+/// `VICTORY_WINDOWS_INPLACE_MOST` (16) windows open at most,
+/// `VICTORY_WINDOWS_INPLACE_AFTER_S` (120) seconds from the first pass
+/// before any opens (never in the load), `VICTORY_WINDOWS_INPLACE_FREE_MB`
+/// (3584) free RAM below which none opens, `VICTORY_WINDOWS_INPLACE_MIN_KB`
+/// (256) bytes a window's refreshes must have copied in the last two
+/// seconds. The in-place stage this rests on is VIctory's and XCL's
+/// upstream; opening by address through a view of ours is avatarmanz's
+/// port 1 (`crate::port`).
+pub(crate) fn windows_inplace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOWS_INPLACE").is_some_and(|v| v == "1"))
+}
+
+fn windows_arg(name: &str, default: u64) -> u64 {
+    std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+}
+
+/// Windows [`windows_step`] opened and the title has not remapped since.
+static WINDOWS_OPEN: AtomicU64 = AtomicU64::new(0);
+
+/// The PC's free physical memory, in MB.
+fn free_mb() -> u64 {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: plain data with its length set, filled by the query.
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: as above.
+    unsafe { GlobalMemoryStatusEx(&mut m) };
+    m.ullAvailPhys >> 20
+}
+
+/// [`windows_inplace`]'s step, at each pass over the heap's buffer views
+/// (`crate::draw`): every two seconds, once the world has been up a while
+/// and free RAM allows, the windows whose refreshes copied the most since
+/// the last step are opened in place, up to four a step and the cap in all.
+/// Returns the windows opened, and those let go since (the title mapped
+/// other pages there): the title slots that view them are to be made again.
+pub(crate) fn windows_step() -> Vec<(u64, u64)> {
+    let mut out = std::mem::take(&mut *crate::shadow::WINDOWS_LET_GO.lock().unwrap_or_else(|e| e.into_inner()));
+    if !out.is_empty() {
+        let n = out.len() as u64;
+        let _ = WINDOWS_OPEN.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |open| Some(open.saturating_sub(n)));
+    }
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    static REFUSED: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
+    let now = START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64;
+    if now < windows_arg("VICTORY_WINDOWS_INPLACE_AFTER_S", 120) * 1000 || now < LAST.load(Ordering::Relaxed) + 2000 {
+        return out;
+    }
+    LAST.store(now, Ordering::Relaxed);
+    let (most, floor, least) = (
+        windows_arg("VICTORY_WINDOWS_INPLACE_MOST", 16),
+        windows_arg("VICTORY_WINDOWS_INPLACE_FREE_MB", 3584),
+        windows_arg("VICTORY_WINDOWS_INPLACE_MIN_KB", 256) << 10,
+    );
+    // (Taken each step whatever comes next: the bytes are the last two seconds'.)
+    let busiest = crate::shadow::windows_by_recent(1 << 32);
+    let open = WINDOWS_OPEN.load(Ordering::Relaxed);
+    if open >= most || free_mb() < floor {
+        return out;
+    }
+    let Some(host) = crate::host::host() else {
+        return out;
+    };
+    let mut refused = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut opened = 0;
+    for (start, len, bytes) in busiest {
+        if bytes < least || open + opened >= most || opened >= 4 {
+            break;
+        }
+        if refused.contains(&(start, len)) {
+            continue;
+        }
+        match crate::port::open_window(&host.device, start, len) {
+            Ok(placed) => {
+                if crate::shadow::window_swap(start, len, placed) {
+                    opened += 1;
+                    STATS[0].fetch_add(1, Ordering::Relaxed);
+                    STATS[1].fetch_add(len, Ordering::Relaxed);
+                    out.push((start, len));
+                    tracing::info!(
+                        start = format_args!("{start:#x}"),
+                        len,
+                        copied_kb = bytes >> 10,
+                        open = open + opened,
+                        "a window of the page pool opened in place (VICTORY_WINDOWS_INPLACE)"
+                    );
+                }
+            }
+            Err(why) => {
+                refused.push((start, len));
+                if STATS[5].fetch_add(1, Ordering::Relaxed) < 16 {
+                    tracing::info!(start = format_args!("{start:#x}"), len, why, "a window of the page pool stays a copy (VICTORY_WINDOWS_INPLACE)");
+                }
+            }
+        }
+    }
+    WINDOWS_OPEN.fetch_add(opened, Ordering::Relaxed);
+    out
+}
+
 /// Something placed elsewhere (`crate::port`) in the same form: counted as
 /// [`place_for`] counts, so that [`gone`] takes it off again.
 pub(crate) fn counted(window: bool, bytes: u64) {
@@ -1547,4 +1656,34 @@ pub(crate) mod tests {
             mem::VirtualFree(base as *mut c_void, 0, mem::MEM_RELEASE);
         }
     }
+}
+
+/// Every ten seconds (diagnostics): the PC's free memory and commit left,
+/// our private bytes, and what is in place (`VICTORY_WINDOWS_INPLACE`), so
+/// that a run's memory can be set beside another's second by second.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn windows_line() {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = crate::host::now_ms();
+    let last = LAST.load(Ordering::Relaxed);
+    if now < last + 10_000 || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return;
+    }
+    // SAFETY: plain data with its length set, filled by the query.
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: as above.
+    unsafe { GlobalMemoryStatusEx(&mut m) };
+    let (_, private) = crate::copystat::process_memory();
+    tracing::info!(
+        "pool memory (VICTORY_WINDOWS_INPLACE {}): free RAM {} MB, commit left {} MB, private {} MB, in place {} windows {} MB (locked), windows opened in place now {}",
+        if windows_inplace() { "on" } else { "off" },
+        m.ullAvailPhys >> 20,
+        m.ullAvailPageFile >> 20,
+        private >> 20,
+        STATS[0].load(Ordering::Relaxed),
+        STATS[1].load(Ordering::Relaxed) >> 20,
+        WINDOWS_OPEN.load(Ordering::Relaxed),
+    );
 }
