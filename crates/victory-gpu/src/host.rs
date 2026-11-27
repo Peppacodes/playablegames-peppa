@@ -1219,13 +1219,18 @@ mod tests {
         for _ in 0..1000 {
             list.keep(&a);
         }
-        assert_eq!((list.deferred().kept.len(), list.deferred().kept_at.len()), (1, 1));
+        // (One guard at a time: `deferred` locks the list.)
+        let counts = |list: &HostList| {
+            let d = list.deferred();
+            (d.kept.len(), d.kept_at.len())
+        };
+        assert_eq!(counts(&list), (1, 1));
         list.keep(&b);
-        assert_eq!((list.deferred().kept.len(), list.deferred().kept_at.len()), (2, 2));
+        assert_eq!(counts(&list), (2, 2));
         list.close();
         host.execute(&[&list]);
         list.reset();
-        assert!(list.deferred().kept.is_empty() && list.deferred().kept_at.is_empty());
+        assert_eq!(counts(&list), (0, 0));
         list.keep(&a);
         assert_eq!(list.deferred().kept.len(), 1);
         list.close();
@@ -8345,8 +8350,9 @@ mod wide_refresh_tests {
 }
 
 /// Whether a submission's working containers are kept, emptied, for the
-/// next one instead of made anew (`VICTORY_SCRATCH=0`: made anew each time,
-/// as before; flips with the in-run A/B). The submitting thread made some
+/// next one instead of made anew (`VICTORY_SCRATCH=1`; off by default: made
+/// anew each time, as before; flips with the in-run A/B). Measured at
+/// -0.3 ms once the load settles (run L7S1), under the 1 ms bar. The submitting thread made some
 /// 11,000 blocks a frame (run L7E1's work census), regrowing the same maps
 /// and lists from empty for every submission: `hashbrown`'s
 /// `reserve_rehash` alone was 3.3% of the thread. What is kept: the batch
@@ -8358,7 +8364,7 @@ pub(crate) fn scratch() -> bool {
         return on;
     }
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SCRATCH").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| crate::switch::on("VICTORY_SCRATCH"))
 }
 
 thread_local! {
@@ -8795,7 +8801,12 @@ impl Batch {
     /// An empty batch: with [`scratch`], the one this thread's last
     /// submission gave back (its containers keep their room); else a new one.
     fn taken() -> Batch {
-        if scratch()
+        Self::taken_if(scratch())
+    }
+
+    /// [`Batch::taken`] with the switch given.
+    fn taken_if(kept: bool) -> Batch {
+        if kept
             && let Some(batch) = SPARE_BATCH.with(|s| s.borrow_mut().take())
         {
             return batch;
@@ -8805,8 +8816,13 @@ impl Batch {
 
     /// The submission is done with it: with [`scratch`] emptied and kept
     /// for this thread's next submission, else dropped.
-    fn give_back(mut self) {
-        if !scratch() {
+    fn give_back(self) {
+        self.give_back_if(scratch());
+    }
+
+    /// [`Batch::give_back`] with the switch given.
+    fn give_back_if(mut self, kept: bool) {
+        if !kept {
             return;
         }
         self.clear();
@@ -8816,7 +8832,7 @@ impl Batch {
     /// Every container emptied (their room kept), as `Batch::default()`.
     fn clear(&mut self) {
         // Named field by field: a field added later must be emptied here too.
-        let Batch { refreshes, index, textures, due, placed, fills, ahead, front } = self;
+        let Batch { refreshes, index, textures, due, placed, fills, ahead, front, last_ahead } = self;
         refreshes.clear();
         index.clear();
         textures.clear();
@@ -8825,6 +8841,7 @@ impl Batch {
         fills.clear();
         ahead.clear();
         *front = false;
+        *last_ahead = (0, 0, 0);
     }
 
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
@@ -11069,18 +11086,18 @@ mod refresh_tests {
         crate::watch::ask_once_end();
     }
 
-    /// A batch given back (`VICTORY_SCRATCH`, on by default) comes back to
-    /// the next submission of the thread empty, with its room.
+    /// A batch given back (`VICTORY_SCRATCH=1`) comes back to the next
+    /// submission of the thread empty, with its room.
     #[test]
     fn a_batch_given_back_comes_back_empty() {
-        let mut batch = Batch::taken();
+        let mut batch = Batch::taken_if(true);
         batch.textures.insert(7);
         batch.fills.push((1, 2, 3));
         batch.ahead.insert(5, (1, 2));
         batch.index.insert(5, 0);
         batch.front = true;
-        batch.give_back();
-        let again = Batch::taken();
+        batch.give_back_if(true);
+        let again = Batch::taken_if(true);
         assert!(again.refreshes.is_empty() && again.index.is_empty() && again.textures.is_empty() && again.due.is_empty());
         assert!(again.placed.is_empty() && again.fills.is_empty() && again.ahead.is_empty() && !again.front);
         assert!(again.textures.capacity() > 0 && again.fills.capacity() > 0, "kept with its room");
