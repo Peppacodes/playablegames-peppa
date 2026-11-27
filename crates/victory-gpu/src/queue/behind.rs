@@ -686,7 +686,15 @@ impl Work for Job {
             Job::Signal(..) => {}
             Job::Run(_, more, order) => {
                 let runs: Vec<&crate::host::HostList> = order.iter().map(|&i| more[i].host()).collect();
-                if count >= most || lists.1.len() + runs.len() > most_lists || !crate::host::joinable(hosts(), &runs) {
+                let why = if count >= most {
+                    Some(REFUSED_PARTS)
+                } else if lists.1.len() + runs.len() > most_lists {
+                    Some(REFUSED_LISTS)
+                } else {
+                    crate::host::unjoinable(hosts(), &runs)
+                };
+                if let Some(why) = why {
+                    REFUSED[why.min(REFUSED.len() - 1)].fetch_add(1, Relaxed);
                     return Err(next);
                 }
             }
@@ -820,6 +828,13 @@ const SENT: usize = 11;
 /// entries taken from other queues than the first's, waits among them;
 /// waits for parts not translated: microseconds, met, timed out.
 static MERGE_STATS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+/// Submissions a join refused, by cause: the parts a host submission may
+/// hold, the lists, then `crate::host::unjoinable`'s (a title buffer copy
+/// or work of ours in it, a fill's read, a texture or plane, a copy at its
+/// place).
+static REFUSED: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+const REFUSED_PARTS: usize = 0;
+const REFUSED_LISTS: usize = 1;
 const MERGE_EMPTY: usize = 0;
 const MERGE_PRESENT: usize = 1;
 const MERGE_FOLDED: usize = 2;
@@ -864,7 +879,7 @@ const MERGE_HELD_OUT: usize = 9;
 /// never earlier, and no part in it waits for them on the CPU's side, nor
 /// for anything the title's threads do next. What a part reads on the CPU
 /// while it is prepared is checked against what the parts before it in the
-/// gathering give their shaders, as before (`crate::host::joinable`).
+/// gathering give their shaders, as before (`crate::host::unjoinable`).
 fn merge_on() -> bool {
     #[cfg(feature = "diagnostics")]
     if let Some(on) = crate::ab::pick("VICTORY_MERGE_SUBMISSIONS") {
@@ -877,6 +892,11 @@ fn merge_on() -> bool {
 /// The longest a gathering waits for a part not translated yet
 /// (`VICTORY_MERGE_SUBMISSIONS_US`, 200 microseconds; 0: never).
 fn merge_window() -> Duration {
+    // `VICTORY_MERGE_LONG_HOLD` in the in-run A/B: upstream's 500.
+    #[cfg(feature = "diagnostics")]
+    if crate::ab::pick("VICTORY_MERGE_LONG_HOLD") == Some(true) {
+        return Duration::from_micros(500);
+    }
     static US: OnceLock<u64> = OnceLock::new();
     Duration::from_micros(*US.get_or_init(|| number("VICTORY_MERGE_SUBMISSIONS_US").map_or(200, |us| us as u64)))
 }
@@ -1155,6 +1175,18 @@ pub(super) fn line(frames: f64) {
         m[MERGE_HELD_US] / 1000.0,
         m[MERGE_HELD_MET],
         m[MERGE_HELD_OUT],
+    );
+    let r: Vec<f64> = REFUSED.iter().map(|s| s.swap(0, Relaxed) as f64 / frames).collect();
+    tracing::info!(
+        "submissions a join refused, per frame, by cause: the parts a host submission holds {:.1}, the lists {:.1}, \
+         a title buffer copy or work of ours in it {:.1}, a fill reading what an earlier part's shaders write {:.1}, \
+         a texture or movie plane there {:.1}, a copy at its place {:.1} (VICTORY_JOIN_PARTS, VICTORY_JOIN_LISTS)",
+        r[REFUSED_PARTS],
+        r[REFUSED_LISTS],
+        r[crate::host::UNJOINABLE_STEP],
+        r[crate::host::UNJOINABLE_FILL],
+        r[crate::host::UNJOINABLE_TEXTURE],
+        r[crate::host::UNJOINABLE_PLACED],
     );
 }
 
