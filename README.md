@@ -1,11 +1,11 @@
 # playablegames-peppa
 
-**The game's world works on NVIDIA at 20 to 22 fps, confirmed on an RTX 5080
+**The game's world works on NVIDIA at 23 fps, confirmed on an RTX 5080
 (2026-11-27).** This tree runs the game's own executable,
 `game_scarlett_master.exe` (build 1.0.2.1, an Xbox Series title), from the
 user's own copy: from a save into the open world, in-game and playable with a
-controller, at 21.7 fps held over a 12 minute run standing in a house interior
-(three shorter runs of the same build: 20.1 to 21.5 fps).
+controller, at 23.5 fps held over a 12 minute run standing in a house interior
+(three shorter runs of the same build: 22.8 to 23.9 fps).
 
 | Milestone | Status |
 |---|---|
@@ -13,9 +13,9 @@ controller, at 21.7 fps held over a 12 minute run standing in a house interior
 | In the world, from a save | Works |
 | Playable with a controller | Works: a 55 minute session without a crash |
 | Story progress | First missions: the first mission completed, side tasks completed, and driving around the world by day and by night (the owner's own play) |
-| Performance | 21.7 fps average over 12 minutes in a house interior (three 5 minute runs: 20.1 to 21.5), on a named PC: RTX 5080 16 GB, Ryzen 7 5700X3D, 32 GB RAM, Windows 11; the goal is 30 |
+| Performance | 23.5 fps average over 12 minutes in a house interior (three 5 minute runs: 22.8 to 23.9), on a named PC: RTX 5080 16 GB, Ryzen 7 5700X3D, 32 GB RAM, Windows 11; the goal is 30 |
 | Rendering | Lit and whole, with known faults; ray tracing is off |
-| Stability | A 55 minute session without a crash; a night of 61 scripted runs with no lost device and no driver error; memory steady at about 27 GB |
+| Stability | A 55 minute session without a crash; a night of 61 scripted runs with no lost device and no driver error; memory at about 28 GB |
 
 That is on an NVIDIA RTX 5080 with 32 GB of RAM. Figures, method and known
 faults: [Where it stands](#where-it-stands-2026-11-27).
@@ -48,20 +48,22 @@ after the driver had finished compiling shaders.
 
 | Build and settings | ms a frame (median) | fps |
 |---|---|---|
-| This tree with `Play-VIctory.cmd`'s settings, a 12 minute run | 46.0 (p10 43.9, p90 47.6) | 21.7 |
-| The same, three 5 minute runs | 46.5, 49.4, 49.7 | 20.1-21.5 |
+| This tree with `Play-VIctory.cmd`'s settings, a 12 minute run | 42.5 (p10 41.1, p90 46.2) | 23.5 |
+| The same, three 5 minute runs | 43.9, 41.8, 42.7 | 22.8-23.9 |
+| The same before the title's submissions were merged (pull request 20), a 12 minute run; three 5 minute runs | 46.0; 46.5, 49.4, 49.7 | 21.7; 20.1-21.5 |
 | The same before the allocator change and the copy-back skip (pull request 17), a 12 minute run | 53.5 (p10 51.2, p90 55.5) | 18.7 |
 | The same code before the five switches and the 2026-11-27 changes (pull requests 1, 2 and 4), four runs | 68-113 | 9-15 |
 | The tree as it was on 2026-11-25 (Series S with the title's FidelityFX upscaler), two runs | 138.0, 138.8 | 7.2 |
 
 How to read these. They are one PC's figures. The same build lands on different
-medians from load to load (three 4 minute runs of the second row's build: 56.3,
+medians from load to load (three 4 minute runs of the fourth row's build: 56.3,
 50.0 and 58.2 ms), so each switch was judged inside one run, flipped every 10 s
 (`VICTORY_AB=<seconds>,<SWITCH>`, diagnostics builds), over 5 to 11 cycles. The
 GPU crate's unit tests run with
-`cargo test -p victory-gpu --lib --features "diagnostics mimalloc"`: 427 pass,
+`cargo test -p victory-gpu --lib --features "diagnostics mimalloc"`: 440 pass,
 and four known ones fail (two of them on the base tree too). The
-process holds about 27 GB of private memory, steady over 12 minutes. Earlier figures (2026-11-26, Series X, the first room):
+process holds about 28 GB of private memory over 12 minutes (27.9 GB after the
+first minute, 28.9 at its highest, 28.4 at the end). Earlier figures (2026-11-26, Series X, the first room):
 61-67 ms for this tree against 77.3 for avatarmanz's on the same PC.
 
 The Rust side of the layer allocates through mimalloc, not the Windows process
@@ -83,8 +85,9 @@ The switches the launcher sets, all measured on this card with the in-run A/B:
 | `VICTORY_LAND_ASIDE=1` | Landed lists are reset on a thread of their own | -2 to -4 ms |
 | `VICTORY_PLACED_ORDER=1` | A copy at its place in a list holds back the card's steps only if they stand behind it, not the whole submission | -2 ms |
 | `VICTORY_SKIP_WC_BACK=1` with `VICTORY_SKIP_WC_KEEP=1048576` | What shaders wrote to write-combining title memory stays on the card; declared ranges up to 1 MiB are still fetched back | -3.9 ms, in 44 of 44 cycles |
+| `VICTORY_MERGE_SUBMISSIONS=1` | Consecutive submissions of the title go to the card as one: about 41 a frame become about 8 | -1.9 ms mean, in 10 of 11 cycles |
 
-About the last row: the 1 MiB keep is there because the title's CPU code reads
+About the copy-back row: the 1 MiB keep is there because the title's CPU code reads
 small ranges back (its exposure, counts and visibility lists); without the
 second switch the picture is wrong (overexposed, blocks). Where the title's CPU
 code writes part of a larger piece the card wrote, stale bytes could go up; none
@@ -94,6 +97,9 @@ comes from Zignixx's RTX 5080 write-up in fxceless/victory-fork issue 1379.
 What sets the frame now: one thread of ours, the one that prepares each
 submission of the title's work for the card. It is busy the whole frame, and the
 title, the list threads and the card (about 18 ms of the frame) all wait for it.
+A census of that thread's work (`VICTORY_WORK_CENSUS`) puts most of what is left
+in the bytes its refreshes copy, about 47 MB a frame, not in the pages walked or
+in repeated requests.
 Tried on this card without a gain, so that nobody has to again:
 `VICTORY_PORT_CONSTANTS` (the card then reads the constants over the bus: 126 ms
 a frame), `VICTORY_PORT_DESCRIPTORS`, a thin-LTO AVX2 build, 6 or 12 list threads
@@ -101,7 +107,12 @@ instead of 8, `VICTORY_LANE_CORE`, `VICTORY_CARD_BUFFERS_MIN_KB=256`,
 `VICTORY_VIEW_BYTES=0`, `VICTORY_COLD_SKIP=1` with `VICTORY_FEED_ONE_CALL=1`
 (0.6 ms together; both are in the tree, off), and two ways of giving that thread
 a helper thread (draft pull requests 13 and 16: 7 and 2 ms slower, because the
-processor is already near full).
+processor is already near full). Also in the tree and off, each within half a
+millisecond in its A/B: `VICTORY_SCRATCH`, `VICTORY_REFRESH_STAMP`,
+`VICTORY_COMPARE_JOIN` with `VICTORY_READBACK_POOL` and
+`VICTORY_WATCH_RESERVATION`, and `VICTORY_GUARD_BITS` with
+`VICTORY_WATCH_TEXTURES_JOINED`, `VICTORY_SPARSE_REFRESH` and
+`VICTORY_WRITE_JOBS`. `VICTORY_QUIET_WINDOWS=check` found no quiet window here.
 
 What is known to be wrong or missing on NVIDIA:
 
@@ -214,7 +225,12 @@ Results, bug reports and pull requests are all welcome.
   (`VICTORY_FEED_ONE_CALL`); Marvisak/VIctory pull request 3384 (borosf: the
   sorted snapshot pool); and two small changes after ZigZagBoi1's and
   XaviFortes's public trees (`ask_ahead` returning early, a lock-free
-  `has_pending`).
+  `has_pending`); LooperSalty/AnyXboxX pull requests 337 and 362 (Skyfrye:
+  `VICTORY_MERGE_SUBMISSIONS`, `VICTORY_WRITE_JOBS`); fxceless pull requests
+  1359 (fxceless), 1365 and 1406 (spk-c); Marvisak/VIctory pull request 3379
+  (Texbirds); and changes after the public trees of DoubleGhosty (the joined
+  compares), KevinPratap (`VICTORY_GUARD_BITS`, the textures' one asking),
+  ka1qux (`VICTORY_QUIET_WINDOWS`) and XaviFortes (the last-ahead cache).
   Written here: the card copies' scans narrowed to the copies touched,
   `VICTORY_SKIP_WC_KEEP`, and timeline diagnostics that sample every thread
   (`VICTORY_TIMELINE_ALL`, `VICTORY_TIMELINE_FAST`).

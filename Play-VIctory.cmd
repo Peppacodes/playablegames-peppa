@@ -57,6 +57,8 @@ rem Shader writes to write-combining memory stay on the card; declared ranges
 rem up to 1 MiB are still fetched back (README: -3.9 ms, same A/B).
 if not defined VICTORY_SKIP_WC_BACK set "VICTORY_SKIP_WC_BACK=1"
 if not defined VICTORY_SKIP_WC_KEEP set "VICTORY_SKIP_WC_KEEP=1048576"
+rem Consecutive submissions of the title go to the card as one (README: -1.9 ms).
+if not defined VICTORY_MERGE_SUBMISSIONS set "VICTORY_MERGE_SUBMISSIONS=1"
 if not defined VICTORY_LOG if not defined RUST_LOG set "VICTORY_LOG=warn"
 "%runner%" run "%VICTORY_GAME_DIR%\game_scarlett_master.exe" --console series-s --execute
 exit /b %errorlevel%
