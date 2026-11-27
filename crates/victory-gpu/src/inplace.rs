@@ -134,6 +134,14 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
 /// buffers or a title buffer, if [`level`] asks for it and the memory can
 /// be opened; `None` leaves the caller to make a copy, as before.
 pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
+    // A window of the page pool, made of committed slabs (`VICTORY_POOL_SLABS`).
+    if window && pool_slabs() && STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len <= most()
+        && let Some(placed) = place_in_slab(start, len)
+    {
+        STATS[0].fetch_add(1, Ordering::Relaxed);
+        STATS[1].fetch_add(len, Ordering::Relaxed);
+        return Some(placed);
+    }
     if level() < if window { 1 } else { 2 } {
         return None;
     }
@@ -165,6 +173,122 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
             None
         }
     }
+}
+
+/// `VICTORY_POOL_SLABS=1` (off by default; the runtime's `xmem` reads it
+/// too): the page pool is made as committed slabs of 64 MiB, and a window
+/// of it (outside title buffers) that is one run of one slab is placed in
+/// the slab's section, opened as a heap once ([`From::Section`]:
+/// `OpenExistingHeapFromFileMapping` locks no page), instead of copied.
+/// The card's shaders read those windows from the PC's memory either way
+/// (a window's copy is a host buffer there); now they read the title's own
+/// pages, with nothing to refresh. Title buffers keep their copies. The
+/// in-place stage this rests on is VIctory's and XCL's upstream.
+pub(crate) fn pool_slabs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_POOL_SLABS").is_some_and(|v| v == "1"))
+}
+
+/// Slabs of the page pool the runtime made ([`pool_slab_made`]): how many,
+/// and their bytes.
+static SLABS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// The runtime made a slab of the page pool, committed
+/// (`VICTORY_POOL_SLABS`); [`title_memory_section`] tells its handle.
+pub fn pool_slab_made(bytes: u64) {
+    SLABS[0].fetch_add(1, Ordering::Relaxed);
+    SLABS[1].fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// A slab's section opened as a heap, by the section's handle.
+struct SlabHeap(usize, ID3D12Heap);
+// SAFETY: D3D12 heaps are free-threaded.
+unsafe impl Send for SlabHeap {}
+
+/// The slabs opened so far ([`place_in_slab`]); a section gone, or its
+/// handle's number given out again, takes its heap off.
+static SLAB_HEAPS: std::sync::Mutex<Vec<SlabHeap>> = std::sync::Mutex::new(Vec::new());
+
+fn slab_heaps_forget(section: usize) {
+    SLAB_HEAPS.lock().unwrap_or_else(|e| e.into_inner()).retain(|h| h.0 != section);
+}
+
+/// Window `[start, start + len)` in place in a slab of the page pool, if
+/// it is one run of one committed section: a buffer placed in the
+/// section's heap over its 64 KiB pages.
+fn place_in_slab(start: u64, len: u64) -> Option<Placed> {
+    let Cover::Run(section, offset) = cover(start as usize, len as usize) else {
+        return None;
+    };
+    let bytes = views().sections.iter().find(|s| s.0 == section).filter(|s| s.2).map(|s| s.1)?;
+    let at = offset & !(K64 as u64 - 1);
+    let size = (offset + len.max(1)).next_multiple_of(K64 as u64) - at;
+    if at + size > bytes {
+        return None;
+    }
+    let host = crate::host::host()?;
+    let heap = {
+        let mut heaps = SLAB_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        match heaps.iter().find(|h| h.0 == section) {
+            Some(h) => h.1.clone(),
+            None => match open(&host.device, From::Section(section)) {
+                Ok(heap) => {
+                    heaps.push(SlabHeap(section, heap.clone()));
+                    heap
+                }
+                Err(e) => {
+                    if STATS[5].fetch_add(1, Ordering::Relaxed) < 8 {
+                        tracing::warn!(error = %e, "a slab of the page pool not opened (VICTORY_POOL_SLABS): its windows are copied");
+                    }
+                    return None;
+                }
+            },
+        }
+    };
+    let buffer = match place(&host.device, &heap, at, size) {
+        Ok(buffer) => buffer,
+        Err(e) => {
+            if STATS[5].fetch_add(1, Ordering::Relaxed) < 8 {
+                tracing::warn!(error = %e, at, size, "a window not placed in its slab (VICTORY_POOL_SLABS): copied");
+            }
+            return None;
+        }
+    };
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (offset - at);
+    Some(Placed { buffer, heap, gpu, bias: offset - at })
+}
+
+/// Every ten seconds (diagnostics): the PC's free memory and commit left,
+/// our private bytes, what is in place, and the slabs made
+/// (`VICTORY_POOL_SLABS`), so that a run's memory can be set beside
+/// another's minute by minute.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn pool_line() {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = crate::host::now_ms();
+    let last = LAST.load(Ordering::Relaxed);
+    if now < last + 10_000 || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return;
+    }
+    // SAFETY: plain data with its length set, filled by the query.
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: as above.
+    unsafe { GlobalMemoryStatusEx(&mut m) };
+    let (_, private) = crate::copystat::process_memory();
+    tracing::info!(
+        "pool memory (VICTORY_POOL_SLABS {}): free RAM {} MB, commit left {} MB, private {} MB, in place {} windows {} MB, slabs made {} ({} MB)",
+        if pool_slabs() { "on" } else { "off" },
+        m.ullAvailPhys >> 20,
+        m.ullAvailPageFile >> 20,
+        private >> 20,
+        STATS[0].load(Ordering::Relaxed),
+        STATS[1].load(Ordering::Relaxed) >> 20,
+        SLABS[0].load(Ordering::Relaxed),
+        SLABS[1].load(Ordering::Relaxed) >> 20
+    );
 }
 
 /// Something placed elsewhere (`crate::port`) in the same form: counted as
@@ -312,6 +436,7 @@ fn views_mut() -> std::sync::RwLockWriteGuard<'static, Views> {
 /// The runtime made a section of `bytes` for physical pages; `committed`
 /// if with `SEC_COMMIT` (only such a section can be opened as a heap).
 pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
+    slab_heaps_forget(section);
     let mut v = views_mut();
     v.sections.retain(|s| s.0 != section);
     // A handle's number given out again: the view was of the section that
@@ -323,6 +448,7 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
 /// The runtime lets go of a section, and of its handle: no view the title
 /// sees is of it any more, and [`beside`]'s view goes.
 pub fn title_memory_section_gone(section: usize) {
+    slab_heaps_forget(section);
     let whole = {
         let mut v = views_mut();
         let at = v.whole.iter().position(|w| w.0 == section);
@@ -1337,6 +1463,32 @@ pub(crate) fn tick() {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// A page array mapped across a slab's end (`VICTORY_POOL_SLABS`) is two
+    /// views, one of each slab's section: a window inside either is one run
+    /// of that slab at the right offset, one across both is scattered, and
+    /// a stretch ends where the slab does.
+    #[test]
+    fn a_window_across_slabs_is_no_run_and_one_inside_is() {
+        const SLAB: u64 = 64 << 20;
+        let base = 0x9_0000_0000usize;
+        let k = K64;
+        let mut views = BTreeMap::new();
+        // The last two pages of slab A (handle 1), then the first two of slab B (handle 2).
+        views.insert(base, (2 * k, 1usize, SLAB - 2 * k as u64));
+        views.insert(base + 2 * k, (2 * k, 2usize, 0u64));
+        assert_eq!(cover_in(&views, base, 4 * k), Cover::Scattered);
+        assert_eq!(cover_in(&views, base + k / 2, k), Cover::Run(1, SLAB - 2 * k as u64 + (k / 2) as u64));
+        assert_eq!(cover_in(&views, base + 2 * k, 2 * k), Cover::Run(2, 0));
+        assert_eq!(stretch_in(&views, base + 2 * k, k), Some((base + 2 * k, 2 * k, 2, 0)));
+        assert_eq!(stretch_in(&views, base, k), Some((base, 2 * k, 1, SLAB - 2 * k as u64)));
+        // Two views of one slab that continue each other: one run, one stretch.
+        let mut one = BTreeMap::new();
+        one.insert(base, (k, 3usize, 10 * k as u64));
+        one.insert(base + k, (3 * k, 3usize, 11 * k as u64));
+        assert_eq!(cover_in(&one, base, 4 * k), Cover::Run(3, 10 * k as u64));
+        assert_eq!(stretch_in(&one, base + 2 * k, k), Some((base, 4 * k, 3, 10 * k as u64)));
+    }
 
     /// Views as the runtime tells them: a range inside one view, or over
     /// views that continue each other in one section, is one run; over

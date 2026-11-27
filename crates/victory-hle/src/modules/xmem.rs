@@ -395,7 +395,11 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 const PAGE: usize = 64 << 10;
 
 struct Section {
-    handle: HANDLE,
+    /// The section's handle: made with the section, or, for a slab of the
+    /// page pool ([`pool_slabs`]), when first asked for ([`Section::handle`]).
+    made: std::sync::OnceLock<HANDLE>,
+    /// A slab of the page pool, made committed when first used.
+    slab: bool,
     pages: usize,
     /// A view of the whole section, kept ([`Section::window`]); 0 if the
     /// host gave none.
@@ -404,7 +408,88 @@ struct Section {
     committed: Box<[std::sync::atomic::AtomicU64]>,
 }
 
+/// Pages of a slab of the page pool ([`pool_slabs`]): 64 MiB.
+const SLAB_PAGES: usize = 1024;
+
+/// An allocation of physical pages at least this big is the page pool
+/// ([`pool_slabs`]): the title asks for 6.1 GiB at once; its 32-bit heap
+/// and the rest are far smaller and stay one section each.
+const POOL_PAGES: usize = (1 << 30) / PAGE;
+
+/// `VICTORY_POOL_SLABS=1` (off by default; not under Wine, which commits
+/// the pool whole anyway): the page pool is made as committed sections of
+/// 64 MiB ([`SLAB_PAGES`]), each when the title's mappings first reach
+/// it, instead of one reserved section, so that the GPU side can open the
+/// windows of it the title's shaders read in place (`victory_gpu`'s
+/// `inplace`): a committed section opens as a host heap, a reserved one
+/// does not. After the other project's public patch 0063 (committed 64 MiB
+/// slabs); written for this tree. Commit then follows the slabs the title
+/// maps pages of, 64 MiB at a time, rather than the pages.
+fn pool_slabs() -> bool {
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("VICTORY_POOL_SLABS").is_some_and(|v| v == "1") && !on_wine());
+    *ON
+}
+
+/// Slab and page in it of page `page` of a pool.
+const fn slab_of(page: usize) -> (usize, usize) {
+    (page / SLAB_PAGES, page % SLAB_PAGES)
+}
+
 impl Section {
+    /// A section made now, with its handle.
+    fn made(handle: HANDLE, pages: usize) -> Section {
+        let made = std::sync::OnceLock::new();
+        let _ = made.set(handle);
+        Section {
+            made,
+            slab: false,
+            pages,
+            window: std::sync::OnceLock::new(),
+            committed: (0..pages.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
+        }
+    }
+
+    /// A slab of the page pool, made when first used ([`Section::handle`]).
+    fn slab(pages: usize) -> Section {
+        Section {
+            made: std::sync::OnceLock::new(),
+            slab: true,
+            pages,
+            window: std::sync::OnceLock::new(),
+            committed: (0..pages.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
+        }
+    }
+
+    /// The section's handle; a slab's section is made here, committed, the
+    /// first time (null if the host refused: the caller's mapping fails as
+    /// for any refused mapping).
+    fn handle(&self) -> HANDLE {
+        *self.made.get_or_init(|| {
+            debug_assert!(self.slab);
+            let bytes = self.pages * PAGE;
+            // SAFETY: plain section creation.
+            let handle = unsafe {
+                CreateFileMappingW(
+                    INVALID_HANDLE_VALUE,
+                    std::ptr::null(),
+                    PAGE_READWRITE | SEC_COMMIT,
+                    (bytes as u64 >> 32) as u32,
+                    bytes as u32,
+                    std::ptr::null(),
+                )
+            };
+            if handle.is_null() {
+                let error = std::io::Error::last_os_error();
+                tracing::warn!(%error, bytes, "a slab of the page pool was not made (VICTORY_POOL_SLABS)");
+                return handle;
+            }
+            victory_gpu::title_memory_section(handle as usize, bytes as u64, true);
+            victory_gpu::pool_slab_made(bytes as u64);
+            handle
+        })
+    }
+
     /// Where bytes of `n` pages from page `index` on can be written,
     /// whether or not the pages are mapped anywhere, committed.
     ///
@@ -425,7 +510,7 @@ impl Section {
         }
         let base = *self.window.get_or_init(|| {
             // SAFETY: the whole of a section we own.
-            unsafe { MapViewOfFile(self.handle, FILE_MAP_WRITE, 0, 0, self.pages * PAGE) }.Value as usize
+            unsafe { MapViewOfFile(self.handle(), FILE_MAP_WRITE, 0, 0, self.pages * PAGE) }.Value as usize
         });
         if base == 0 {
             return None;
@@ -498,9 +583,13 @@ impl Drop for Section {
                 })
             };
         }
-        victory_gpu::title_memory_section_gone(self.handle as usize);
+        // (A slab never used was never made.)
+        let Some(&handle) = self.made.get().filter(|h| !h.is_null()) else {
+            return;
+        };
+        victory_gpu::title_memory_section_gone(handle as usize);
         // SAFETY: our handle; views keep the section alive on their own.
-        unsafe { CloseHandle(self.handle) };
+        unsafe { CloseHandle(handle) };
     }
 }
 
@@ -655,6 +744,23 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
         return 0;
     };
+    // The page pool as slabs ([`pool_slabs`]): nothing is made now.
+    if pool_slabs() && n >= POOL_PAGES {
+        tracing::info!(n, slabs = n.div_ceil(SLAB_PAGES), "the page pool is made as committed slabs of 64 MiB, each when first used (VICTORY_POOL_SLABS)");
+        let slices = slab_slices(n);
+        let mut table = page_table_mut();
+        let first = table.next_page;
+        table.next_page += n * FRAMES;
+        for (index, slice) in slices.into_iter().enumerate() {
+            table.pages.insert(first + index * FRAMES, slice);
+        }
+        drop(table);
+        for index in 0..n {
+            // SAFETY: the title passes room for `n` page numbers.
+            unsafe { pages.add(index).write(first + index * FRAMES) };
+        }
+        return 1;
+    }
     // A pagefile-backed section of `size` bytes, its pages committed when
     // first mapped or written (`commit`): the title asks for 6.1
     // GiB at once, which a busy host often cannot commit (error 1450).
@@ -688,12 +794,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
     victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
-    let section = Arc::new(Section {
-        handle,
-        pages: n,
-        window: std::sync::OnceLock::new(),
-        committed: (0..n.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
-    });
+    let section = Arc::new(Section::made(handle, n));
     let mut table = page_table_mut();
     let first = table.next_page;
     table.next_page += n * FRAMES;
@@ -712,6 +813,20 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         unsafe { pages.add(index).write(first + index * FRAMES) };
     }
     1
+}
+
+/// The slices of a pool of `n` pages made as slabs: page `i` is page
+/// `i % SLAB_PAGES` of slab `i / SLAB_PAGES` (the last slab holds the rest).
+fn slab_slices(n: usize) -> Vec<Slice> {
+    let slabs: Vec<Arc<Section>> = (0..n.div_ceil(SLAB_PAGES))
+        .map(|s| Arc::new(Section::slab(SLAB_PAGES.min(n - s * SLAB_PAGES))))
+        .collect();
+    (0..n)
+        .map(|i| {
+            let (slab, index) = slab_of(i);
+            Slice { section: slabs[slab].clone(), index }
+        })
+        .collect()
 }
 
 /// Page numbers count 4 KiB frames, so a 64 KiB page's is a multiple of
@@ -749,7 +864,7 @@ impl View {
         // SAFETY: slices of a section we own; the view is ours until dropped.
         let at = unsafe {
             MapViewOfFile(
-                slice.section.handle,
+                slice.section.handle(),
                 FILE_MAP_WRITE,
                 (offset >> 32) as u32,
                 offset as u32,
@@ -1579,7 +1694,7 @@ fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
                 // As in `map`.
                 shown_mut().note(op.at, PAGE, &slice);
                 victory_gpu::title_memory_remapped(op.at, PAGE);
-                victory_gpu::title_memory_view(op.at, PAGE, slice.section.handle as usize, (slice.index * PAGE) as u64);
+                victory_gpu::title_memory_view(op.at, PAGE, slice.section.handle() as usize, (slice.index * PAGE) as u64);
                 physical.views.insert(op.at, (PAGE, slice));
             }
             None if op.had && done => {
@@ -1725,7 +1840,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
     // What the range shows now, for the GPU side's in-place census.
-    victory_gpu::title_memory_view(base, len, slice.section.handle as usize, (slice.index * PAGE) as u64);
+    victory_gpu::title_memory_view(base, len, slice.section.handle() as usize, (slice.index * PAGE) as u64);
     physical.views.insert(base, (len, slice));
     true
 }
@@ -1750,7 +1865,7 @@ fn show(base: usize, len: usize, slice: &Slice, own: bool) -> bool {
         // SAFETY: maps the section over a placeholder; acts only on one.
         counted(Call::Map, || unsafe {
             MapViewOfFile3(
-                slice.section.handle,
+                slice.section.handle(),
                 GetCurrentProcess(),
                 base as *const c_void,
                 (slice.index * PAGE) as u64,
@@ -2023,6 +2138,55 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pool made as slabs: page `i` is page `i % 1024` of slab
+    /// `i / 1024`, the last slab holds the rest, and no slab's section is
+    /// made before it is used.
+    #[test]
+    fn a_pool_of_slabs_numbers_its_pages_slab_by_slab() {
+        assert_eq!(slab_of(0), (0, 0));
+        assert_eq!(slab_of(1023), (0, 1023));
+        assert_eq!(slab_of(1024), (1, 0));
+        assert_eq!(slab_of(5000), (4, 904));
+        let n = 2 * SLAB_PAGES + 10;
+        let slices = slab_slices(n);
+        assert_eq!(slices.len(), n);
+        assert!(Arc::ptr_eq(&slices[0].section, &slices[1023].section));
+        assert!(!Arc::ptr_eq(&slices[1023].section, &slices[1024].section));
+        assert_eq!((slices[1024].index, slices[n - 1].index), (0, 9));
+        assert_eq!((slices[0].section.pages, slices[n - 1].section.pages), (SLAB_PAGES, 10));
+        assert!(slices.iter().all(|s| s.section.slab && s.section.made.get().is_none()));
+    }
+
+    /// A page array across a slab's end is two runs, one of each slab, as
+    /// pages of two allocations always were.
+    #[test]
+    fn a_page_array_across_slabs_maps_as_one_run_a_slab() {
+        let slices = slab_slices(SLAB_PAGES + 4);
+        let numbers: Vec<usize> = {
+            let mut table = page_table_mut();
+            let first = table.next_page;
+            table.next_page += slices.len() * FRAMES;
+            for (i, slice) in slices.iter().enumerate() {
+                table.pages.insert(first + i * FRAMES, slice.clone());
+            }
+            (0..slices.len()).map(|i| first + i * FRAMES).collect()
+        };
+        // Pages 1022..1026: the last two of slab 0, the first two of slab 1.
+        let found = runs(&numbers, 1022 * PAGE, 4 * PAGE).expect("all pages known");
+        assert_eq!(found.len(), 2);
+        assert_eq!((found[0].0.index, found[0].1), (1022, 2));
+        assert_eq!((found[1].0.index, found[1].1), (0, 2));
+        assert!(Arc::ptr_eq(&found[0].0.section, &slices[0].section));
+        assert!(Arc::ptr_eq(&found[1].0.section, &slices[SLAB_PAGES].section));
+        // Inside one slab: one run.
+        let one = runs(&numbers, 10 * PAGE, 64 * PAGE).expect("all pages known");
+        assert_eq!((one.len(), one[0].0.index, one[0].1), (1, 10, 64));
+        let mut table = page_table_mut();
+        for number in &numbers {
+            table.pages.remove(number);
+        }
+    }
 
     fn query(address: *const c_void) -> BasicInformation {
         // SAFETY: plain data; zero is a valid value.

@@ -1165,6 +1165,7 @@ fn page_faults() -> u64 {
 /// frames' counts as one's).
 pub(crate) fn log(frames: f64) {
     crate::workcensus::tick();
+    crate::inplace::pool_line();
     {
         static TOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !TOLD.swap(true, Relaxed) {
