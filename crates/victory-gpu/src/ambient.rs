@@ -176,8 +176,38 @@ fn magenta() -> bool {
     })
 }
 
+/// Whether what the title's program left, and what the air scatters, are
+/// bounded colour by colour (`VICTORY_AMBIENT_CHROMA=1`; unset or anything
+/// else: by their luminance alone, as before). Luminance counts blue at a
+/// fourteenth and red at a fifth, so saturated blue, purple and red blocks
+/// of the probes' memory passed a bound of `most` times the estimate's
+/// luminance where the estimate is dark. Each channel is then held to
+/// `most` times the estimate's same channel, the colour kept (the floor,
+/// [`floor`], keeps that above nothing). After NitricAcidDev's public
+/// tree, 1413ac81 (on by default there; off here).
+fn chroma() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_AMBIENT_CHROMA").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// The least light the estimate gives any point, before the creases' shade
+/// (`VICTORY_AMBIENT_FLOOR=<level>`, in the units of `constant:<level>`;
+/// unset or 0: none). The estimate is the light visible surfaces send out,
+/// so a corridor of dark walls lit by a few lamps stays nearly black where
+/// the console's traced bounce light would lift it. After NitricAcidDev's
+/// public tree, 88316ee8.
+fn floor() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| floor_of(&std::env::var("VICTORY_AMBIENT_FLOOR").unwrap_or_default()))
+}
+
+fn floor_of(set: &str) -> f32 {
+    set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0)
+}
+
 /// Bits of the passes' `flags` word.
 const FLAG_MAGENTA: u32 = 1;
+const FLAG_CHROMA: u32 = 2;
 
 /// Milliseconds since the last keeping ([`Role::Radiance`], once a frame);
 /// the first, and after a pause of over a second, as a frame of 30.
@@ -218,7 +248,7 @@ const SOURCE: &str = r#"
 cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
-    float follow; float most; float air; float unused;
+    float follow; float most; float air; float least;
     float jump; float fresh; float dt; uint flags;
 };
 Texture2D<float> depth : register(t0);
@@ -336,7 +366,8 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
     // LOCAL: a NaN or infinity in the air is summed along every view ray
     // through it: black or white patches floating in the room.
     if (any(isnan(c)) || any(isinf(c))) { scattered[at] = 0; return; }
-    float has = dot(c, LUMA);
+    // VICTORY_AMBIENT_CHROMA (flags bit 1): colour by colour.
+    float has = (flags & 2u) != 0 ? max(c.r, max(c.g, c.b)) : dot(c, LUMA);
     if (has > cap) scattered[at] = c * (cap / has);
 }
 #endif
@@ -413,6 +444,9 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
+    // VICTORY_AMBIENT_FLOOR: no point darker than the floor (shaded in
+    // creases like the rest; nothing when unset).
+    if (least > 0.0) found = max(found, float3(1.0, 0.98, 0.94) * least * open);
     float3 was = unpack(light[p]);
     // VICTORY_AMBIENT_MAGENTA (flags bit 0): magenta (green far below red
     // and blue) is what the probes' memory held, not light.
@@ -423,9 +457,17 @@ void raise(uint3 at : SV_DispatchThreadID) {
     // title's leftover counts for no more than the estimate, then up to
     // `most` times it again: its history holds the place before.
     float bound = fresh > 0.0 ? lerp(1.0, most, saturate(cells[CELLS].a / fresh)) : most;
-    float top = max(dot(found, LUMA) * bound, 1e-6);
-    float has = dot(was, LUMA);
-    was *= min(1.0, top / max(has, 1e-6));
+    if ((flags & 2u) != 0) {
+        // VICTORY_AMBIENT_CHROMA: each channel held to `bound` times the
+        // estimate's same channel, the colour kept.
+        float3 cap = max(found * bound, 1e-6);
+        float3 over = was / cap;
+        was *= min(1.0, 1.0 / max(max(over.r, over.g), max(over.b, 1e-6)));
+    } else {
+        float top = max(dot(found, LUMA) * bound, 1e-6);
+        float has = dot(was, LUMA);
+        was *= min(1.0, top / max(has, 1e-6));
+    }
     light[p] = pack(max(was, found));
 }
 #endif
@@ -545,7 +587,16 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
         let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
         if *said < 4 {
             *said += 1;
-            tracing::info!(?role, size = ?views.size, level, constant, "a stand-in for the indirect light");
+            tracing::info!(
+                ?role,
+                size = ?views.size,
+                level,
+                constant,
+                floor = floor(),
+                chroma = chroma(),
+                magenta = magenta(),
+                "a stand-in for the indirect light"
+            );
         }
     }
     list.keep(&pass.cells);
@@ -574,7 +625,8 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[12] = settle().map_or(0.0f32, |s| s.jump).to_bits();
     words[13] = settle().map_or(0.0f32, |s| s.fresh).to_bits();
     words[14] = dt.to_bits();
-    words[15] = if magenta() { FLAG_MAGENTA } else { 0 };
+    words[11] = floor().to_bits();
+    words[15] = (if magenta() { FLAG_MAGENTA } else { 0 }) | (if chroma() { FLAG_CHROMA } else { 0 });
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -623,6 +675,10 @@ mod tests {
         assert_eq!(parse("0.8"), Set::Estimate(0.8));
         assert_eq!(parse("constant:0.3"), Set::Constant(0.3));
         assert_eq!(parse("constant:nan"), Set::Off);
+        assert_eq!(floor_of(""), 0.0);
+        assert_eq!(floor_of("0.05"), 0.05);
+        assert_eq!(floor_of("-1"), 0.0);
+        assert_eq!(floor_of("nan"), 0.0);
     }
 
     #[test]
