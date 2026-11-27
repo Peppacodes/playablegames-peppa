@@ -547,6 +547,18 @@ fn window_mapped_most() -> u64 {
     })
 }
 
+/// How full the card's budget may be, in percent, for another window to go
+/// into card memory the CPU maps (`VICTORY_WINDOWS_BAR_PCT`, 80 if not
+/// given, 10 to 99). From avatarmanz/VIctory-7900XTX pull request 391
+/// (tightfall): on a 16 GB card the budget is about 80 % used before the
+/// world loads, so at 80 few windows go there.
+fn window_mapped_percent() -> u64 {
+    static PCT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PCT.get_or_init(|| {
+        std::env::var("VICTORY_WINDOWS_BAR_PCT").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(80).clamp(10, 99)
+    })
+}
+
 /// Bytes alive of windows in card memory the CPU maps.
 static WINDOW_MAPPED_BYTES: AtomicU64 = AtomicU64::new(0);
 
@@ -568,7 +580,7 @@ fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
     }
     let host = host()?;
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && used + size > budget / 100 * window_mapped_percent()
     {
         WINDOW_MAPPED_REFUSED[0].fetch_add(1, Ordering::Relaxed);
         return None;

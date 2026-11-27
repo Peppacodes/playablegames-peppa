@@ -1482,7 +1482,7 @@ fn memory_line() {
     let (budget, used) = crate::host::host().and_then(|h| h.video_memory()).map_or((0, 0), |[b, u, ..]| (b, u));
     let refused: Vec<u64> = crate::shadow::WINDOW_MAPPED_REFUSED.iter().map(|r| r.load(Relaxed)).collect();
     tracing::info!(
-        "pool memory (VICTORY_WINDOWS_BAR_MB {}): free RAM {} MB, commit left {} MB, private {} MB, card {} of {} MB in use, windows in card memory the CPU maps {} MB now {} (did not fit: {} over the 80% budget line, {} over the MB asked, {} refused by the host)",
+        "pool memory (VICTORY_WINDOWS_BAR_MB {}): free RAM {} MB, commit left {} MB, private {} MB, card {} of {} MB in use, windows in card memory the CPU maps {} MB now {} (did not fit: {} over the budget line (VICTORY_WINDOWS_BAR_PCT), {} over the MB asked, {} refused by the host)",
         std::env::var("VICTORY_WINDOWS_BAR_MB").unwrap_or_else(|_| "unset".into()),
         m.ullAvailPhys >> 20,
         m.ullAvailPageFile >> 20,
