@@ -4117,6 +4117,7 @@ impl Shadow {
             let started = std::time::Instant::now();
             let copied = self.update_uncounted(address, len);
             crate::workcensus::refreshed(self.id as usize, address, len, self.card.is_some(), copied, started.elapsed().as_nanos() as u64);
+            crate::workcensus::copy_refreshed(self.id, self.start, self.len, self.window, self.card.is_some(), copied, started.elapsed().as_nanos() as u64);
             return copied;
         }
         self.update_uncounted(address, len)

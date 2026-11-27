@@ -230,6 +230,75 @@ fn report() {
     tracing::info!("work census, refreshes by caller (one in {REFRESH_EVERY} sampled): {}", top.join("; "));
     let cores: Vec<String> = CORES.iter().enumerate().filter(|c| c.1.load(Relaxed) > 0).map(|(i, c)| format!("{i}: {}", c.load(Relaxed))).collect();
     tracing::info!("work census, submissions begun by processor: {}", cores.join(", "));
+    copies_report(frames);
     ALLOC_STACKS.clear();
     REFRESH_STACKS.clear();
+}
+
+/// Per copy, in a lossy table: id, start, bytes, window (1) and card (2)
+/// bits, bytes refreshed, requests, nanoseconds.
+static COPIES: [[AtomicU64; 7]; 4096] = [const { [const { AtomicU64::new(0) }; 7] }; 4096];
+
+/// [`refreshed`]'s copy, for the table of the copies refreshed most.
+pub(crate) fn copy_refreshed(id: u64, start: u64, len: u64, window: bool, card: bool, copied: usize, ns: u64) {
+    let mut i = (id.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 52) as usize % COPIES.len();
+    for _ in 0..16 {
+        let slot = &COPIES[i];
+        let there = slot[0].compare_exchange(0, id + 1, Relaxed, Relaxed).unwrap_or_else(|v| v);
+        if there == 0 || there == id + 1 {
+            slot[1].store(start, Relaxed);
+            slot[2].store(len, Relaxed);
+            slot[3].store(u64::from(window) | u64::from(card) << 1, Relaxed);
+            slot[4].fetch_add(copied as u64, Relaxed);
+            slot[5].fetch_add(1, Relaxed);
+            slot[6].fetch_add(ns, Relaxed);
+            return;
+        }
+        i = (i + 1) % COPIES.len();
+    }
+}
+
+/// The copies that took the most refresh time, and the sizes of all of
+/// them, by class (logged with the census).
+fn copies_report(frames: f64) {
+    let mut all: Vec<[u64; 6]> = COPIES
+        .iter()
+        .filter(|s| s[0].load(Relaxed) != 0)
+        .map(|s| [s[1].load(Relaxed), s[2].load(Relaxed), s[3].load(Relaxed), s[4].load(Relaxed), s[5].load(Relaxed), s[6].load(Relaxed)])
+        .collect();
+    all.sort_unstable_by(|a, b| b[5].cmp(&a[5]));
+    let top: Vec<String> = all
+        .iter()
+        .take(16)
+        .map(|c| {
+            format!(
+                "{:#x} {:.2} MB {}{}: {:.2} MB {:.1} requests {:.2} ms",
+                c[0],
+                c[1] as f64 / 1e6,
+                if c[2] & 2 != 0 { "card" } else { "host" },
+                if c[2] & 1 != 0 { " window" } else { "" },
+                c[3] as f64 / frames / 1e6,
+                c[4] as f64 / frames,
+                c[5] as f64 / frames / 1e6
+            )
+        })
+        .collect();
+    tracing::info!("work census, the copies refreshed longest, a frame: {}", top.join("; "));
+    // Host copies above 4 GiB by size: copies, MB refreshed, ms.
+    let mut by = [[0f64; 3]; 5];
+    for c in all.iter().filter(|c| c[2] & 2 == 0 && c[0] >= 1 << 32) {
+        let b = match c[1] {
+            0..0x1_0000 => 0,
+            0x1_0000..0x10_0000 => 1,
+            0x10_0000..0x100_0000 => 2,
+            0x100_0000..0x1000_0000 => 3,
+            _ => 4,
+        };
+        by[b][0] += 1.0;
+        by[b][1] += c[3] as f64 / frames / 1e6;
+        by[b][2] += c[5] as f64 / frames / 1e6;
+    }
+    let names = ["under 64 KiB", "64 KiB-1 MiB", "1-16 MiB", "16-256 MiB", "256 MiB and more"];
+    let parts: Vec<String> = names.iter().zip(by).map(|(n, b)| format!("{n}: {:.0} copies, {:.2} MB, {:.2} ms", b[0], b[1], b[2])).collect();
+    tracing::info!("work census, host copies above 4 GiB by their size, a frame: {}", parts.join("; "));
 }
