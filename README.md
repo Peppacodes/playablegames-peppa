@@ -1,10 +1,11 @@
 # playablegames-peppa
 
-**The game's world works on NVIDIA at over 21 fps, confirmed on an RTX 5080
+**The game's world works on NVIDIA at 20 to 22 fps, confirmed on an RTX 5080
 (2026-11-27).** This tree runs the game's own executable,
 `game_scarlett_master.exe` (build 1.0.2.1, an Xbox Series title), from the
 user's own copy: from a save into the open world, in-game and playable with a
-controller, at 21.7 fps held over a 12 minute run standing in a house interior.
+controller, at 21.7 fps held over a 12 minute run standing in a house interior
+(three shorter runs of the same build: 20.1 to 21.5 fps).
 
 | Milestone | Status |
 |---|---|
@@ -12,7 +13,7 @@ controller, at 21.7 fps held over a 12 minute run standing in a house interior.
 | In the world, from a save | Works |
 | Playable with a controller | Works: a 55 minute session without a crash |
 | Story progress | First missions: the first mission completed, side tasks completed, and driving around the world by day and by night (the owner's own play) |
-| Performance | 21.7 fps average over 12 minutes in a house interior, on a named PC: RTX 5080 16 GB, Ryzen 7 5700X3D, 32 GB RAM, Windows 11; the goal is 30 |
+| Performance | 21.7 fps average over 12 minutes in a house interior (three 5 minute runs: 20.1 to 21.5), on a named PC: RTX 5080 16 GB, Ryzen 7 5700X3D, 32 GB RAM, Windows 11; the goal is 30 |
 | Rendering | Lit and whole, with known faults; ray tracing is off |
 | Stability | A 55 minute session without a crash; a night of 61 scripted runs with no lost device and no driver error; memory steady at about 27 GB |
 
@@ -48,6 +49,7 @@ after the driver had finished compiling shaders.
 | Build and settings | ms a frame (median) | fps |
 |---|---|---|
 | This tree with `Play-VIctory.cmd`'s settings, a 12 minute run | 46.0 (p10 43.9, p90 47.6) | 21.7 |
+| The same, three 5 minute runs | 46.5, 49.4, 49.7 | 20.1-21.5 |
 | The same before the allocator change and the copy-back skip (pull request 17), a 12 minute run | 53.5 (p10 51.2, p90 55.5) | 18.7 |
 | The same code before the five switches and the 2026-11-27 changes (pull requests 1, 2 and 4), four runs | 68-113 | 9-15 |
 | The tree as it was on 2026-11-25 (Series S with the title's FidelityFX upscaler), two runs | 138.0, 138.8 | 7.2 |
@@ -64,9 +66,12 @@ process holds about 27 GB of private memory, steady over 12 minutes. Earlier fig
 
 The Rust side of the layer allocates through mimalloc, not the Windows process
 heap it shared with the title and the driver. It is on by default in the build
-(`VICTORY_ALLOC=system` goes back for one run): 5.6 ms off the median over two
-alternated pairs of runs, 4 ms of it in the time the layer spends preparing a
-frame.
+(`VICTORY_ALLOC=system` goes back for one run): about 2 ms off the median over
+three alternated pairs of runs (48.5 against 50.2 ms), the same in the time the
+layer spends preparing a frame. The submitting thread's time inside ntdll, where
+the process heap lives, fell from 42-44% to 32-34%, with about 3% now in
+mimalloc's own code. A first figure of 5.6 ms, from two pairs, was mostly the
+difference between loads.
 
 The switches the launcher sets, all measured on this card with the in-run A/B:
 
