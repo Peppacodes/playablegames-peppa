@@ -9831,8 +9831,16 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
         if info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
-            // SAFETY: this path is only used with a writable host destination.
-            unsafe { to.write_bytes(0, n) };
+            if crate::texture::committed(to, n) {
+                // SAFETY: a committed host destination of `n` bytes.
+                unsafe { to.write_bytes(0, n) };
+            } else {
+                // A destination only partly committed (run RTTR: 9 MB written
+                // into a copy committed for its first 0.5 MB, write fault on
+                // reserved memory): zeros page by page through the safe copy,
+                // which leaves out what is not there.
+                for_pieces(to as usize, n, 4 << 10, |at, k| zero(at as *mut u8, k));
+            }
         } else if !read(at, to, n) {
             // A mapping may change between query and read.
             read_pieces(at, to, n);
