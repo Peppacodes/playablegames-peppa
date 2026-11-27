@@ -159,6 +159,26 @@ fn settle() -> Option<Settle> {
     })
 }
 
+/// Whether a magenta value the title's program left is dropped instead of
+/// kept as light (`VICTORY_AMBIENT_MAGENTA=1`; unset or anything else: kept,
+/// as before). Green under half of the lesser of red and blue, and not
+/// black: that is what the probes' memory held in blocks of the picture,
+/// not light; it showed as flat purple and pink glows. After Loydben's
+/// public tree, 1bf62e10, from Belobug's 81ebb7bd.
+fn magenta() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_AMBIENT_MAGENTA").is_ok_and(|v| v.trim() == "1");
+        if on {
+            tracing::info!("the stand-in drops magenta the title's resolve left (VICTORY_AMBIENT_MAGENTA)");
+        }
+        on
+    })
+}
+
+/// Bits of the passes' `flags` word.
+const FLAG_MAGENTA: u32 = 1;
+
 /// Milliseconds since the last keeping ([`Role::Radiance`], once a frame);
 /// the first, and after a pause of over a second, as a frame of 30.
 fn frame_ms() -> f32 {
@@ -189,7 +209,7 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=15, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
+#define RS "RootConstants(num32BitConstants=16, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -199,7 +219,7 @@ cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
     float follow; float most; float air; float unused;
-    float jump; float fresh; float dt;
+    float jump; float fresh; float dt; uint flags;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -394,6 +414,9 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
     float3 was = unpack(light[p]);
+    // VICTORY_AMBIENT_MAGENTA (flags bit 0): magenta (green far below red
+    // and blue) is what the probes' memory held, not light.
+    if ((flags & 1u) != 0 && was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = 0.0;
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
     // For `fresh` seconds after the light around jumped (a new room) the
@@ -529,7 +552,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     list.keep(&pass.points);
     let [strength, radius] = shade();
     let floats = [level, constant, strength, radius, 0.1, 0.45];
-    let mut words = [0u32; 15];
+    let mut words = [0u32; 16];
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
@@ -551,6 +574,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[12] = settle().map_or(0.0f32, |s| s.jump).to_bits();
     words[13] = settle().map_or(0.0f32, |s| s.fresh).to_bits();
     words[14] = dt.to_bits();
+    words[15] = if magenta() { FLAG_MAGENTA } else { 0 };
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -558,7 +582,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 15, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 16, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
