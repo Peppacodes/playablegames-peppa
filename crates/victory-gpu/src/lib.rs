@@ -38,6 +38,8 @@ mod heap;
 static HEAP: heap::Chosen = heap::Chosen;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod faultbook;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod workcensus;
 #[cfg(windows)]
 mod cores;
 pub mod descriptor;
@@ -74,6 +76,8 @@ mod popwatch;
 mod primitive;
 pub mod query;
 pub mod queue;
+#[cfg(windows)]
+mod quiet;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub mod replay;
 #[cfg(windows)]

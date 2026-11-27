@@ -983,3 +983,31 @@ mod tests {
         assert!(text.contains("frames in"));
     }
 }
+
+/// Diagnostics census (`crate::workcensus`): each stack named by its two
+/// innermost functions that are not the standard library's, the system's or
+/// named in `skip`; counted, the most first.
+pub(crate) fn census_sites(stacks: &[Vec<usize>], skip: &[&str]) -> Vec<(String, usize)> {
+    let mut names = Names::new();
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for stack in stacks {
+        let mut parts: Vec<String> = Vec::new();
+        for &address in stack {
+            let name = names.of(address);
+            let plain = name.trim_start_matches('<').trim_start_matches("impl$").trim_start_matches(|c: char| c.is_ascii_digit());
+            let skipped = ["std::", "core::", "alloc::"].iter().any(|p| plain.starts_with(p))
+                || ["KERNEL", "ntdll", "kernel", "VCRUNTIME", "ucrtbase", "?"].iter().any(|p| name.starts_with(p))
+                || skip.iter().any(|p| name.contains(p));
+            if !skipped {
+                parts.push(name.replace("victory_gpu::", "").chars().take(110).collect());
+            }
+            if parts.len() == 2 {
+                break;
+            }
+        }
+        *counts.entry(parts.join(" < ")).or_default() += 1;
+    }
+    let mut all: Vec<(String, usize)> = counts.into_iter().collect();
+    all.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    all
+}

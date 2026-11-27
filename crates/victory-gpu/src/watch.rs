@@ -54,6 +54,9 @@ fn parts_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PAGE_PARTS").is_none_or(|v| v != "0"))
 }
 
+mod reservation;
+pub(crate) use reservation::line as reservation_line;
+
 impl Journal {
     /// Page `page` was found written by asking `now`: the parts in `parts`
     /// (a bit each). The asking that found it written before (0: none).
@@ -298,7 +301,14 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
             tally(0, 1);
             tally(1, ((last - first) * (PAGE >> 10)) as u64);
         }
-        let mut pages: Vec<(usize, u16)> = Vec::new();
+        // With the scratch switch: room for exactly the pages there are (the
+        // answer is in order), not grown push by push.
+        let room = if crate::host::scratch() {
+            found[..count].windows(2).filter(|w| w[0] / PAGE != w[1] / PAGE).count() + usize::from(count > 0)
+        } else {
+            0
+        };
+        let mut pages: Vec<(usize, u16)> = Vec::with_capacity(room);
         for &at in &found[..count] {
             let (page, part) = (at / PAGE, 1u16 << (at % PAGE / KERNEL_PAGE));
             match pages.last_mut() {
@@ -574,6 +584,12 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     // other threads' askings again (0.5 ms a time, run fills-ab3), and no
     // other asking comes between the two parts.
     let _all = Asking::hold_all();
+    if reservation::enabled() {
+        spent.next("asking: by allocation");
+        reservation::ask(ranges);
+        spent.end();
+        return;
+    }
     ask_ahead_held(ranges.iter().copied(), true);
     spent.next("asking: the rest");
     ask_rest(ranges, true);
@@ -1533,6 +1549,10 @@ fn placeholder(block: usize) -> bool {
 /// The runtime gave the title memory at `[at, at + len)`, allocated or
 /// committed: what was known of holes there is asked again.
 pub fn title_memory_allocated(at: usize, len: usize) {
+    // (`VICTORY_WATCH_RESERVATION`: the allocations it asked by changed.)
+    if reservation::enabled() {
+        ask_once_end();
+    }
     if len == 0 || !known_holes() {
         return;
     }
@@ -1638,6 +1658,99 @@ fn guards_timed_shared() -> std::sync::RwLockReadGuard<'static, Guards> {
     #[cfg(feature = "diagnostics")]
     tally(7, started.elapsed().as_nanos() as u64);
     g
+}
+
+/// Whether an asking whose blocks are all clean is answered from the clean
+/// blocks' bits again in [`CLEAN_BITS`], before the guards' lock, the
+/// question whether the memory is a view, and the walk of the clean set
+/// (`VICTORY_GUARD_BITS=1`; off by default).
+///
+/// After KevinPratap's public tree, commit 0ef6a1e6: there `guard` was
+/// 8.7 % of the submitting thread, about half of it outside Windows, most of
+/// that reading the clean set block by block for ranges that turned out all
+/// clean (here: some 150,000 blocks a frame, nearly all clean).
+///
+/// A block's bit there is set once it is in [`Guards::clean`] (by
+/// [`Clean::insert`], under the guards' lock, shared or alone), and cleared
+/// before it leaves it ([`Clean::remove`]), which every caller does before the
+/// block is made writable or forgotten. So a set bit says what the clean set
+/// says: nothing wrote the block since its copies took it; a write that
+/// comes while the bits are read is as one that comes just after an asking.
+/// Bits are cleared whether the switch is on or not, so flipping it in the
+/// in-run A/B never leaves one set that the set does not hold.
+fn guard_bits() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_GUARD_BITS") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_BITS").is_some_and(|v| v == "1"))
+}
+
+/// [`guard_bits`]: the blocks of [`Guards::clean`] (set only while the switch
+/// is on; see there).
+static CLEAN_BITS: Bits = Bits::new();
+
+/// With [`guard_bits`], since the last line: askings answered by the bits.
+static BITS_ANSWERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// With the frame line.
+pub(crate) fn guard_bits_line(frames: f64) {
+    if !guard_bits() {
+        BITS_ANSWERED.store(0, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+    let answered = BITS_ANSWERED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames;
+    tracing::info!("guarded askings answered all clean by their bits, per frame (VICTORY_GUARD_BITS=1): {answered:.0}");
+}
+
+/// [`Guards::clean`]: a set of blocks whose changes are mirrored in
+/// [`CLEAN_BITS`] ([`guard_bits`]).
+struct Clean(Blocks);
+
+impl Clean {
+    const fn new() -> Clean {
+        Clean(Blocks::new())
+    }
+
+    fn word(&self, word: usize) -> u64 {
+        self.0.word(word)
+    }
+
+    fn contains(&self, block: usize) -> bool {
+        self.0.contains(block)
+    }
+
+    /// Whether it was not there.
+    fn insert(&self, block: usize) -> bool {
+        let new = self.0.insert(block);
+        if guard_bits() {
+            CLEAN_BITS.set(block);
+        }
+        new
+    }
+
+    /// Whether it was there. The bit goes first.
+    fn remove(&self, block: usize) -> bool {
+        CLEAN_BITS.clear(block);
+        self.0.remove(block)
+    }
+
+    fn insert_all(&self, blocks: std::ops::Range<usize>) {
+        for block in blocks {
+            self.insert(block);
+        }
+    }
+
+    /// Those of `range`, in order.
+    fn range(&self, range: impl RangeBounds<usize>) -> impl Iterator<Item = usize> + '_ {
+        self.0.range(range)
+    }
+
+    #[allow(dead_code)]
+    fn len(&self) -> usize {
+        self.0.len()
+    }
 }
 
 /// A set of blocks, a bit each: a fault, or a look at a range of thousands of
@@ -1774,7 +1887,7 @@ struct Guards {
     /// Blocks we made read-only.
     protected: Blocks,
     /// Of those, the ones not written since a copy took them.
-    clean: Blocks,
+    clean: Clean,
     /// Blocks already copied as zeros. While they remain wholly uncommitted,
     /// the copy can skip hundreds of MB of failing kernel reads per world frame.
     absent: Blocks,
@@ -1901,7 +2014,7 @@ impl Guards {
 /// alone otherwise and by what changes more than single blocks' states.
 static GUARDS: RwLock<Guards> = RwLock::new(Guards {
     protected: Blocks::new(),
-    clean: Blocks::new(),
+    clean: Clean::new(),
     absent: Blocks::new(),
     held: Blocks::new(),
     foreign: BTreeSet::new(),
@@ -2130,6 +2243,16 @@ pub(crate) fn written_since_taken(at: usize, len: usize) -> bool {
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
+    // `VICTORY_GUARD_BITS=1`: all clean by the bits, and nothing put in
+    // beside the guards, is what the look under the lock below would find,
+    // with no lock and no question to Windows.
+    let all_clean = |first: usize, last: usize| CLEAN_BITS.all(first, last) && !BESIDE.any(first, last);
+    if guard_bits() && start < end && all_clean(start / BLOCK, end.div_ceil(BLOCK)) {
+        BITS_ANSWERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        tally(3, 1);
+        return Some(Vec::new());
+    }
     // A range whose first block the guards hold already (read-only by our
     // hand, or noted absent) is a view: no question to Windows. The
     // question walks the page tables to the end of the pages that share the
@@ -2771,6 +2894,9 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     if len == 0 {
         return;
     }
+    // (`VICTORY_WATCH_RESERVATION`: what lies under the asking that stands is
+    // noted written after it.)
+    reservation::completed_write(at, len);
     let mode = page_writes();
     let end = at.saturating_add(len);
     if pages {
@@ -3063,6 +3189,10 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// neither guarded nor writable) and a kernel read into it fail, so the
 /// write access is given back.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    // (`VICTORY_WATCH_RESERVATION`: the allocations it asked by changed.)
+    if reservation::enabled() {
+        ask_once_end();
+    }
     crate::texback::remapped(at, len);
     open(&mut title_memory_changed(at, len), at, at.saturating_add(len));
 }

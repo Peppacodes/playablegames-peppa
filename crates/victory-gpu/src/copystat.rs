@@ -411,6 +411,7 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
         // SAFETY: the caller's contract, passed on.
         let at = unsafe { INNER.alloc(layout) };
         if !at.is_null() {
+            crate::workcensus::allocated(layout.size());
             own(layout.size(), true);
             big(at, layout.size(), true);
         }
@@ -421,6 +422,7 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
         // SAFETY: the caller's contract, passed on.
         let at = unsafe { INNER.alloc_zeroed(layout) };
         if !at.is_null() {
+            crate::workcensus::allocated(layout.size());
             own(layout.size(), true);
             big(at, layout.size(), true);
         }
@@ -438,6 +440,7 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
         // SAFETY: the caller's contract, passed on.
         let moved = unsafe { INNER.realloc(at, layout, size) };
         if !moved.is_null() {
+            crate::workcensus::allocated(size);
             own(layout.size(), false);
             own(size, true);
             big(at, layout.size(), false);
@@ -509,8 +512,9 @@ mod own_tests {
     /// and only for at least this block).
     #[test]
     fn a_block_is_counted_while_it_lives() {
-        let block = vec![1u8; 8 << 20];
-        assert!(owned(3) >= 8 << 20);
+        // (Kept from the optimizer, which may leave out a block nothing reads.)
+        let block = std::hint::black_box(vec![1u8; 8 << 20]);
+        assert!(owned(3) >= 8 << 20, "big class {} bytes, {} blocks", owned(3), owned(7));
         assert!(owned(7) >= 1);
         drop(block);
         assert!(owned(7) < u64::MAX / 2, "no count below zero");
@@ -1134,6 +1138,7 @@ pub(crate) fn present_begins() {
 /// A frame was presented.
 pub(crate) fn presented() {
     add(C::Frames, 1);
+    crate::workcensus::presented();
     PRESENTED_AT.store(now_us(), Relaxed);
     RECORDED_SINCE.store(false, Relaxed);
     SUBMITTED_SINCE.store(false, Relaxed);
@@ -1159,6 +1164,7 @@ fn page_faults() -> u64 {
 /// second or more: a 4 s frame after an unlogged 4 s frame showed two
 /// frames' counts as one's).
 pub(crate) fn log(frames: f64) {
+    crate::workcensus::tick();
     {
         static TOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !TOLD.swap(true, Relaxed) {

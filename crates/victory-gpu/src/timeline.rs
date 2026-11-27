@@ -33,6 +33,8 @@ pub use hooks::import;
 pub use record::{Span, span};
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) use record::{called, card_wait, on, polled, presented, sent, ticks, title_thread, told};
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) use report::census_sites;
 
 /// A span of ours: from where it is made until it is dropped.
 #[cfg(not(all(windows, feature = "diagnostics")))]
