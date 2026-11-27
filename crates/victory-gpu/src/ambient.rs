@@ -193,7 +193,10 @@ fn settle() -> Option<Settle> {
 /// as before). Green under half of the lesser of red and blue, and not
 /// black: that is what the probes' memory held in blocks of the picture,
 /// not light; it showed as flat purple and pink glows. After Loydben's
-/// public tree, 1bf62e10, from Belobug's 81ebb7bd.
+/// public tree, 1bf62e10, from Belobug's 81ebb7bd. With `VICTORY_AMBIENT_REFLECT`
+/// set, a magenta miss in the reflection image keeps its level but takes
+/// the colour of the light around it (ours: the cap showed the miss
+/// image's own magenta, clipped to white before it).
 fn magenta() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
@@ -426,7 +429,13 @@ void cap_reflect(uint3 at : SV_DispatchThreadID) {
     float4 c = mirror[at.xy];
     bool bad = any(isnan(c.rgb));
     float has = dot(max(c.rgb, 0.0), LUMA);
-    if (has > cap || bad) mirror[at.xy] = float4(bad ? 0.0 : c.rgb * (cap / has), c.a);
+    // VICTORY_AMBIENT_MAGENTA (flags bit 0): a magenta miss (green far below
+    // red and blue: the sky probe's own colour here, clipped to white when
+    // the cap was off) keeps its level but takes the colour of the light
+    // around it.
+    bool pink = (flags & 1u) != 0 && !bad && c.g < 0.5 * min(c.r, c.b) && max(c.r, c.b) > 0.02;
+    if (pink) c.rgb = all * (has / max(dot(all, LUMA), 1e-6));
+    if (has > cap || bad || pink) mirror[at.xy] = float4(bad ? 0.0 : c.rgb * (has > cap ? cap / has : 1.0), c.a);
 }
 #endif
 
